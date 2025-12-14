@@ -12,6 +12,7 @@ import time
 from datetime import datetime
 from rate_limiter import AsyncTokenBucket
 from typing import List, Dict, Any, Optional, Literal, Union
+from decimal import Decimal, ROUND_DOWN
 
 import aiohttp
 import pandas as pd
@@ -77,7 +78,8 @@ class BitgetBroker(BrokerAPI):
 
         # [NEW] Хранилище правил торговли: symbol -> precision (int)
         self._symbol_rules: Dict[str, int] = {}
-        
+        self._symbol_rules: Dict[str, int] = {}      # qty precision
+        self._price_rules: Dict[str, int] = {}       # price precision
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -102,8 +104,11 @@ class BitgetBroker(BrokerAPI):
             for item in data:
                 s = item.get("symbol", "")
                 # Bitget возвращает 'quantityPrecision' строкой или числом
-                p = int(item.get("quantityPrecision", 4)) 
-                self._symbol_rules[s] = p
+                p_qty = int(item.get("quantityPrecision", 4) or 4)
+                p_px  = int(item.get("pricePrecision", 6) or 6)
+
+                self._symbol_rules[s] = p_qty
+                self._price_rules[s] = p_px
             
             logger.info(f"Bitget: loaded rules for {len(self._symbol_rules)} symbols")
         except Exception as e:
@@ -602,7 +607,7 @@ class BitgetBroker(BrokerAPI):
             quote_size = float(order.quantity) * px
             payload["size"] = str(round(quote_size, 6))
         else:
-            payload["size"] = str(order.quantity)
+            payload["size"] = self._qty_str(order.symbol, float(order.quantity))
 
         if order.order_type == "limit":
             payload["force"] = "gtc"
@@ -610,7 +615,7 @@ class BitgetBroker(BrokerAPI):
         if order.order_type == "limit":
             if order.price is None:
                 raise ValueError("BitgetBroker.place_order: price required for limit order.")
-            payload["price"] = str(order.price)
+            payload["price"] = self._price_str(order.symbol, float(order.price))
 
         client_oid = order.client_id or None
         if client_oid:
@@ -891,14 +896,14 @@ class BitgetBroker(BrokerAPI):
         payload = {
             "symbol": self._to_bitget_symbol(symbol),
             "side": side,  # buy/sell
-            "triggerPrice": str(trigger_price),
+            "triggerPrice": self._price_str(symbol, trigger_price),
             "orderType": order_type,          # limit/market
             "triggerType": trigger_type,      # fill_price/mark_price
             "planType": "amount",             # size в base coin (нам это нужно для закрытия позиции)
-            "size": str(size),
+            "size": self._qty_str(symbol, size),
         }
         if execute_price is not None:
-            payload["executePrice"] = str(execute_price)
+            payload["executePrice"] = self._price_str(symbol, execute_price)
         if client_oid:
             payload["clientOid"] = client_oid
 
@@ -1112,15 +1117,30 @@ class BitgetBroker(BrokerAPI):
 
         return results
     
+    def _q_str(self, value: float, precision: int) -> str:
+        q = Decimal(10) ** (-precision)
+        d = Decimal(str(value)).quantize(q, rounding=ROUND_DOWN)
+        return format(d, "f")  # без scientific notation
+
     def normalize_qty(self, symbol: str, qty: float, price: float | None = None) -> float:
-        # [FIX] Округление согласно правилам биржи
         bg_symbol = self._to_bitget_symbol(symbol)
-        precision = self._symbol_rules.get(bg_symbol, 4) # Дефолт 4 знака, если не нашли
-        
-        # Используем форматирование строк для точного отсечения лишних знаков без округления вверх
-        # (floor rounding безопаснее для продажи, чтобы не превысить баланс)
-        fmt = f"{{:.{precision}f}}"
-        return float(fmt.format(qty))
+        precision = int(self._symbol_rules.get(bg_symbol, 4) or 4)
+        return float(self._q_str(float(qty), precision))
+
+    def normalize_price(self, symbol: str, price: float) -> float:
+        bg_symbol = self._to_bitget_symbol(symbol)
+        precision = int(self._price_rules.get(bg_symbol, 6) or 6)
+        return float(self._q_str(float(price), precision))
+
+    def _qty_str(self, symbol: str, qty: float) -> str:
+        bg_symbol = self._to_bitget_symbol(symbol)
+        precision = int(self._symbol_rules.get(bg_symbol, 4) or 4)
+        return self._q_str(float(qty), precision)
+
+    def _price_str(self, symbol: str, price: float) -> str:
+        bg_symbol = self._to_bitget_symbol(symbol)
+        precision = int(self._price_rules.get(bg_symbol, 6) or 6)
+        return self._q_str(float(price), precision)
 
     async def close_position(self, symbol: str, reason: str = "") -> None:
         # P0: spot close = SELL доступного количества монеты (base asset)
