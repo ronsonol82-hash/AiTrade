@@ -7,6 +7,7 @@ import hashlib
 import inspect
 import time
 import os
+import gc
 import re
 from datetime import datetime
 from typing import Dict, Any
@@ -398,6 +399,306 @@ class AsyncStrategyRunner:
         scale = max(0.0, min(1.0, scale))
         risk = base_risk + (max_risk - base_risk) * scale
         return max(base_risk, min(max_risk, risk))
+    
+    async def _update_dynamic_trailing(self, symbol: str, current_price: float, prot: dict) -> bool:
+        """
+        [LIVE-READY] Moon Mode Lite: динамический трейлинг защит.
+
+        Поддерживает ДВА режима:
+        1) mode="synthetic":
+            - двигаем prot["sl"] (реальный выход MARKET делает _check_protective_exits)
+        2) mode="native" (РЕАЛЬНАЯ ТОРГОВЛЯ):
+            - двигаем реальный SL план-ордер у брокера:
+                    cancel старого SL -> place нового SL (tp не трогаем)
+
+        Возвращает True, если что-то реально обновили (чтобы вызывающий код поставил dirty=True).
+        """
+
+        # --- safety guards ---
+        if getattr(self, "_kill_switch_active", False):
+            return False
+        if not isinstance(prot, dict):
+            return False
+
+        mode = (str(prot.get("mode", "synthetic")) or "synthetic").lower().strip()
+        if mode not in ("synthetic", "native"):
+            return False
+
+        trade_id = str(prot.get("trade_id") or "").strip()
+        if not trade_id:
+            return False
+
+        # --- safe float helper ---
+        def _f(x, default: float = 0.0) -> float:
+            try:
+                v = float(x)
+                if v != v:  # NaN
+                    return default
+                return v
+            except Exception:
+                return default
+
+        cp = _f(current_price, 0.0)
+        if cp <= 0:
+            return False
+
+        sl_price = _f(prot.get("sl"), 0.0)
+        atr = _f(prot.get("atr"), 0.0)
+        qty = _f(prot.get("qty"), 0.0)
+
+        # без SL/ATR/qty двигать нечего
+        if sl_price <= 0 or atr <= 0 or qty <= 0:
+            return False
+
+        # --- config knobs (все с дефолтами, чтобы не падать если нет в Config) ---
+        enabled = bool(getattr(Config, "DYNAMIC_TRAILING_ENABLED", True))
+        if not enabled:
+            return False
+
+        breakeven_atr = _f(getattr(Config, "DYNAMIC_TRAIL_BREAKEVEN_ATR", 1.0), 1.0)
+        breakeven_buffer_atr = _f(getattr(Config, "DYNAMIC_TRAIL_BREAKEVEN_BUFFER_ATR", 0.05), 0.05)
+
+        trigger_dist_atr = _f(getattr(Config, "DYNAMIC_TRAIL_TRIGGER_ATR", 2.5), 2.5)
+        trail_offset_atr = _f(getattr(Config, "DYNAMIC_TRAIL_OFFSET_ATR", 0.8), 0.8)
+
+        min_step_atr = _f(getattr(Config, "DYNAMIC_TRAIL_MIN_STEP_ATR", 0.10), 0.10)
+        cooldown_s = _f(getattr(Config, "DYNAMIC_TRAIL_COOLDOWN_S", 5.0), 5.0)
+
+        # минимальный зазор от текущей цены (спрэд/шум)
+        min_gap_pct = _f(getattr(Config, "DYNAMIC_TRAIL_MIN_GAP_PCT", 0.001), 0.001)  # 0.1%
+        min_gap = max(cp * min_gap_pct, atr * 0.05)
+
+        # --- anti-chatter: cooldown ---
+        now_ts = time.time()
+        last_ts = _f(prot.get("trail_last_ts"), 0.0)
+        if cooldown_s > 0 and last_ts > 0 and (now_ts - last_ts) < cooldown_s:
+            return False
+
+        # --- local high watermark ---
+        prev_max = _f(prot.get("max_price"), 0.0)
+        max_price = max(prev_max, cp)
+        prot["max_price"] = max_price
+
+        # --- entry price: кешируем из prot / ledger / open_trade ---
+        entry_price = _f(prot.get("entry_price"), 0.0)
+
+        if entry_price <= 0 and hasattr(self.ledger, "get_trade_entry_price"):
+            try:
+                entry_price = _f(self.ledger.get_trade_entry_price(trade_id), 0.0)
+            except Exception:
+                entry_price = 0.0
+
+        if entry_price <= 0:
+            broker_name_guess = (str(prot.get("broker") or "")).lower().strip()
+            if broker_name_guess and hasattr(self.ledger, "get_open_trade"):
+                try:
+                    ot = self.ledger.get_open_trade(broker_name_guess, symbol) or {}
+                    entry_price = _f(ot.get("entry_price"), 0.0)
+                except Exception:
+                    entry_price = 0.0
+
+        if entry_price > 0:
+            prot["entry_price"] = entry_price
+
+        # --- stage logic: выбираем лучший кандидат SL (только вверх) ---
+        new_sl_candidate: float | None = None
+
+        # 1) breakeven стадия
+        if entry_price > 0:
+            profit = cp - entry_price
+            profit_atr = (profit / atr) if atr > 0 else 0.0
+            if profit_atr >= breakeven_atr:
+                be_sl = entry_price + (atr * breakeven_buffer_atr)
+                be_sl = min(be_sl, cp - min_gap)
+                if be_sl > sl_price:
+                    new_sl_candidate = be_sl
+
+        # 2) агрессивный трейл по хай-вотермарку, когда стоп “слишком далеко”
+        current_dist = cp - sl_price
+        if current_dist > (atr * trigger_dist_atr):
+            trail_sl = max_price - (atr * trail_offset_atr)
+            trail_sl = min(trail_sl, cp - min_gap)
+            if new_sl_candidate is None:
+                new_sl_candidate = trail_sl
+            else:
+                new_sl_candidate = max(new_sl_candidate, trail_sl)
+
+        if new_sl_candidate is None:
+            return False
+
+        # --- финальные проверки: шаг и направление ---
+        new_sl = float(new_sl_candidate)
+        new_sl = min(new_sl, cp - min_gap)  # не в упор к цене
+
+        min_step = atr * min_step_atr
+        if new_sl <= (sl_price + min_step):
+            return False
+
+        # =========================
+        # MODE: SYNTHETIC
+        # =========================
+        if mode == "synthetic":
+            prot["sl"] = new_sl
+            prot["trail_last_ts"] = now_ts
+            prot["trail_count"] = int(_f(prot.get("trail_count"), 0.0)) + 1
+
+            print(
+                f"🚀 MOON MODE {symbol} [synthetic]: SL {sl_price:.6f} -> {new_sl:.6f} "
+                f"(cp={cp:.6f}, atr={atr:.6f}, max={max_price:.6f})"
+            )
+            return True
+
+        # =========================
+        # MODE: NATIVE (REAL TRADING)
+        # =========================
+        # В не-LIVE не трогаем биржу, но локально обновим для отладки/симуляции.
+        if self._mode_value() != "live":
+            prot["sl"] = new_sl
+            prot["trail_last_ts"] = now_ts
+            prot["trail_count"] = int(_f(prot.get("trail_count"), 0.0)) + 1
+            print(
+                f"🚀 MOON MODE {symbol} [native-sim]: SL {sl_price:.6f} -> {new_sl:.6f} (no-broker, mode={self._mode_value()})"
+            )
+            return True
+
+        # LIVE native: cancel+replace SL только под lock (чтобы не было гонок с kill-switch/exit)
+        async with self._trading_lock:
+            # 1) получаем брокера
+            try:
+                broker = await self.router.get_broker_for_symbol(symbol)
+            except Exception as e:
+                print(f"[WARN] {symbol}: native trail skipped (broker resolve failed): {e}")
+                return False
+
+            broker_name = (str(getattr(broker, "name", "")) or str(prot.get("broker") or "router")).lower().strip()
+
+            # 2) нормализуем цену, если брокер умеет (не обяз.)
+            if hasattr(broker, "normalize_price"):
+                try:
+                    new_sl = float(broker.normalize_price(symbol, new_sl))
+                except Exception:
+                    pass
+
+            # 3) достаем текущий SL order_id из prot["native"]["sl"]["order_id"]
+            native = prot.get("native", {}) or {}
+            old_sl_order_id = str(((native.get("sl") or {}).get("order_id") or "")).strip()
+
+            # 4) генерим новый client_id (уникальный) и пишем в ledger как отдельный action
+            base_sid = str(prot.get("signal_id") or "na")
+            trail_sid = f"{base_sid}|trail|{int(new_sl * 1_000_000)}"
+            new_sl_client_id = self._make_client_id(broker_name, symbol, "slt", trail_sid)
+
+            # reserve (если не прошло — значит уже пытались этот конкретный шаг)
+            try:
+                ok = self.ledger.reserve_order(
+                    new_sl_client_id,
+                    broker=broker_name,
+                    symbol=symbol,
+                    role="sl_trail",
+                    side="sell",
+                    payload={"sl": new_sl, "qty": qty, "prev_sl": sl_price, "prev_order_id": old_sl_order_id},
+                )
+            except Exception:
+                ok = True  # если ledger по какой-то причине недоступен — не блокируем трейлинг
+
+            if not ok:
+                return False
+
+            # 5) отменяем старый SL (TP НЕ трогаем)
+            if old_sl_order_id and hasattr(broker, "cancel_plan_order"):
+                try:
+                    await broker.cancel_plan_order(order_id=str(old_sl_order_id))
+                    # старый client_id (если был) финализируем как canceled
+                    old_client_id = prot.get("sl_client_id")
+                    if old_client_id:
+                        try:
+                            self.ledger.mark_order_final(old_client_id, "canceled", payload={"replaced_by": new_sl_client_id})
+                        except Exception:
+                            pass
+                except Exception as e:
+                    try:
+                        self.ledger.mark_order_final(new_sl_client_id, "failed", payload={"error": f"cancel_old_sl_failed: {e}"})
+                    except Exception:
+                        pass
+                    print(f"[WARN] {symbol}: native trail cancel_old_sl failed: {e}")
+                    return False
+
+            # 6) ставим новый SL (tp_price=None — чтобы TP остался как был)
+            if not hasattr(broker, "place_protection_orders"):
+                try:
+                    self.ledger.mark_order_final(new_sl_client_id, "failed", payload={"error": "broker_has_no_place_protection_orders"})
+                except Exception:
+                    pass
+                print(f"[WARN] {symbol}: native trail skipped (broker has no place_protection_orders)")
+                return False
+
+            # qty normalize (как у тебя в entry)
+            try:
+                qty_n = float(getattr(broker, "normalize_qty", lambda s, q, p=None: q)(symbol, qty, cp))
+            except Exception:
+                qty_n = qty
+            if qty_n <= 0:
+                qty_n = qty
+
+            try:
+                r = await broker.place_protection_orders(
+                    symbol,
+                    qty=float(qty_n),
+                    sl_price=float(new_sl),
+                    tp_price=None,
+                    sl_client_oid=new_sl_client_id,
+                    tp_client_oid=None,
+                )
+
+                new_order_id = str(((r or {}).get("sl") or {}).get("order_id") or "").strip()
+                if not new_order_id:
+                    raise RuntimeError("Native SL placement returned empty order_id")
+
+                try:
+                    self.ledger.mark_order_submitted(new_sl_client_id, new_order_id, payload={"sl": new_sl, "qty": qty_n})
+                except Exception:
+                    pass
+
+                # 7) обновляем prot
+                prot["sl"] = float(new_sl)
+                prot["sl_client_id"] = new_sl_client_id
+                prot["trail_last_ts"] = now_ts
+                prot["trail_count"] = int(_f(prot.get("trail_count"), 0.0)) + 1
+
+                prot["native"] = prot.get("native", {}) or {}
+                prot["native"]["sl"] = {
+                    "order_id": str(new_order_id),
+                    "prev_order_id": str(old_sl_order_id) if old_sl_order_id else None,
+                    "updated_at": datetime.utcnow().isoformat(),
+                }
+
+                print(
+                    f"🚀 MOON MODE {symbol} [native]: SL {sl_price:.6f} -> {new_sl:.6f} "
+                    f"(cp={cp:.6f}, atr={atr:.6f}, max={max_price:.6f}, oid={new_order_id})"
+                )
+                return True
+
+            except Exception as e:
+                try:
+                    self.ledger.mark_order_final(new_sl_client_id, "failed", payload={"error": str(e), "sl": new_sl})
+                except Exception:
+                    pass
+
+                # Если мы в LIVE strict — лучше закрыться, чем остаться без защиты
+                if self._strict_protections_enabled():
+                    try:
+                        await self._panic_close_unprotected(
+                            symbol=symbol,
+                            broker_name=broker_name,
+                            trade_id=trade_id,
+                            reason="native_sl_trail_failed",
+                            signal_id=str(prot.get("signal_id") or "na"),
+                        )
+                    except Exception:
+                        pass
+
+                print(f"[WARN] {symbol}: native trail failed: {e}")
+                return False
 
     async def _check_protective_exits(self) -> None:
         if not self._protections:
@@ -426,6 +727,10 @@ class AsyncStrategyRunner:
                 current_price = float(await broker.get_current_price(symbol))
             except Exception:
                 continue
+
+            # [FIX] Вызов динамического трейлинга
+            if await self._update_dynamic_trailing(symbol, current_price, prot):
+                dirty = True
 
             # сохраняем last_price (полезно для reconcile/логов)
             prot["last_price"] = current_price
@@ -842,6 +1147,8 @@ class AsyncStrategyRunner:
             }
 
         self._persist_state()
+        # [FIX] Принудительная очистка мусора после цикла
+        gc.collect()
 
     async def execute_trade(self, *, symbol: str, side: str, probability: float, risk_per_trade: float, signal_id: str, signal_data: pd.Series, sl_mult: float, tp_mult: float) -> None:
         broker = await self.router.get_broker_for_symbol(symbol)
@@ -1095,6 +1402,10 @@ class AsyncStrategyRunner:
 
 
 async def _amain():
+    # [FIX] Включаем логирование
+    from config import setup_logging
+    setup_logging()
+
     parser = argparse.ArgumentParser(description="Async Strategy Runner")
     parser.add_argument("--signals", type=str, default="data_cache/production_signals_v1.pkl", help="Path to signals pickle")
     parser.add_argument("--assets", type=str, default="", help="Comma-separated tickers to trade (optional)")

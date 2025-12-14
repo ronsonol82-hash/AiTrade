@@ -3,6 +3,29 @@ from enum import Enum
 from dotenv import load_dotenv
 import os, json
 from enum import Enum
+import logging
+from logging.handlers import RotatingFileHandler
+
+def setup_logging():
+    """Настройка ротации логов."""
+    log_formatter = logging.Formatter("%(asctime)s [%(levelname)s] %(message)s")
+    root_logger = logging.getLogger()
+    root_logger.setLevel(logging.INFO)
+
+    # Файл с ротацией (макс 10 МБ, храним 5 файлов)
+    file_handler = RotatingFileHandler("trade_bot.log", maxBytes=10*1024*1024, backupCount=5, encoding='utf-8')
+    file_handler.setFormatter(log_formatter)
+    root_logger.addHandler(file_handler)
+
+    # Консоль
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(log_formatter)
+    root_logger.addHandler(console_handler)
+
+    # Заглушаем болтливые библиотеки
+    logging.getLogger("urllib3").setLevel(logging.WARNING)
+    logging.getLogger("asyncio").setLevel(logging.WARNING)
+    logging.getLogger("aiohttp").setLevel(logging.WARNING)
 
 load_dotenv()
 
