@@ -55,6 +55,7 @@ class ExecutionRouter:
         self._brokers: Dict[str, BrokerAPI] = {}
         self._daily_anchor_date: str | None = None
         self._daily_anchor_equity: float | None = None
+        self._daily_anchor_by_broker: dict[str, float] = {}
 
     # ---------- Lifecycle ----------
     
@@ -108,6 +109,14 @@ class ExecutionRouter:
             self._daily_anchor_date = today
             self._daily_anchor_equity = float(snap.equity or 0.0)
 
+            # NEW: якоря по каждому брокеру отдельно (без валютных конверсий)
+            self._daily_anchor_by_broker = {}
+            for name, st in (snap.details or {}).items():
+                try:
+                    self._daily_anchor_by_broker[name] = float(getattr(st, "equity", 0.0) or 0.0)
+                except Exception:
+                    continue
+
     async def _check_daily_drawdown_guard(self) -> None:
         """
         В LIVE запрещает новые ордера при превышении MAX_DAILY_DRAWDOWN
@@ -129,8 +138,21 @@ class ExecutionRouter:
             return
 
         snap = await self.get_global_account_state()
-        equity = float(snap.equity or 0.0)
 
+        # NEW: проверяем дневной DD по каждому брокеру
+        for name, st in (snap.details or {}).items():
+            anchor_b = float(self._daily_anchor_by_broker.get(name, 0.0) or 0.0)
+            cur_b = float(getattr(st, "equity", 0.0) or 0.0)
+            if anchor_b > 0 and cur_b > 0:
+                dd_b = (anchor_b - cur_b) / anchor_b
+                if dd_b >= max_dd:
+                    raise RuntimeError(
+                        f"[RISK] MAX_DAILY_DRAWDOWN reached for {name}: {dd_b:.2%} >= {max_dd:.2%}. "
+                        f"New orders blocked until next day."
+                    )
+
+        # Fallback: если почему-то нет детализации — старый глобальный вариант
+        equity = float(snap.equity or 0.0)
         dd = (anchor - equity) / anchor
         if dd >= max_dd:
             raise RuntimeError(
