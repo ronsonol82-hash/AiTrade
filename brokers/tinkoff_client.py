@@ -63,6 +63,8 @@ class TinkoffV2Broker(BrokerAPI):
         self._history_min_interval = 60.0 / 25.0  # ~2.4с
         self._last_history_call_ts: float = 0.0
 
+        self._lot_sizes: Dict[str, int] = {}
+
     # =====================================================================
     # Lifecycle
     # =====================================================================
@@ -392,6 +394,29 @@ class TinkoffV2Broker(BrokerAPI):
     # Sync-хелпер для цены
     # ---------------------------------------------------------------------
 
+    # [NEW] Вспомогательный метод получения лотности
+    def _get_lot_size_sync(self, figi: str) -> int:
+        """Получает размер лота для инструмента (синхронно)."""
+        if figi in self._lot_sizes:
+            return self._lot_sizes[figi]
+            
+        url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy"
+        payload = {"idType": "INSTRUMENT_ID_TYPE_FIGI", "id": figi}
+        
+        try:
+            resp = self._post_with_backoff(url, payload, is_history=False)
+            data = resp.json()
+            item = data.get("instrument", {})
+            lot = int(item.get("lot", 1))
+            if lot < 1: lot = 1
+            
+            self._lot_sizes[figi] = lot
+            return lot
+        except Exception as e:
+            print(f"[WARN] Tinkoff: failed to get lot size for {figi}: {e}")
+            return 1 # Fallback
+
+
     def _get_current_price_sync(self, symbol: str) -> float:
         figi = self._resolve_figi(symbol)
 
@@ -529,6 +554,14 @@ class TinkoffV2Broker(BrokerAPI):
 
             # symbol ожидаем как тикер → FIGI
             figi = self._resolve_figi(order.symbol)
+            
+            # [FIX] Получаем лотность и считаем лоты
+            lot_size = self._get_lot_size_sync(figi)
+            raw_qty = float(order.quantity)
+            lots = int(raw_qty // lot_size) # Целое количество лотов
+
+            if lots <= 0:
+                raise ValueError(f"Tinkoff: Quantity {raw_qty} is less than 1 lot ({lot_size}) for {order.symbol}")
 
             url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder"
             direction = "ORDER_DIRECTION_BUY" if order.side == "buy" else "ORDER_DIRECTION_SELL"
@@ -537,7 +570,7 @@ class TinkoffV2Broker(BrokerAPI):
             payload = {
                 "accountId": account_id,
                 "figi": figi,
-                "quantity": int(round(float(order.quantity))),  # P0: лотность грубо
+                "quantity": lots,  # [FIX] Отправляем ЛОТЫ
                 "direction": direction,
                 "orderType": order_type,
                 "orderId": order.client_id or f"bot-{int(time.time()*1000)}",
@@ -557,11 +590,15 @@ class TinkoffV2Broker(BrokerAPI):
             oid = data.get("orderId") or payload["orderId"]
             exec_price = self._q_to_float(data.get("executedOrderPrice", {})) or float(order.price or 0.0)
 
+            # Возвращаем результат
+            # ВАЖНО: quantity возвращаем в ШТУКАХ (акциях), чтобы ledger считал правильно
+            real_quantity = float(lots * lot_size)
+
             return OrderResult(
                 order_id=str(oid),
                 symbol=order.symbol,
                 side=order.side,
-                quantity=float(order.quantity),
+                quantity=real_quantity,
                 price=float(exec_price),
                 status="filled",  # P0: считаем market как filled
                 broker=self.name,

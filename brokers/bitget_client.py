@@ -74,6 +74,9 @@ class BitgetBroker(BrokerAPI):
 
         self._rl = AsyncTokenBucket(rate_per_sec=rps, burst=burst)
         self._inflight = asyncio.Semaphore(max_inflight)
+
+        # [NEW] Хранилище правил торговли: symbol -> precision (int)
+        self._symbol_rules: Dict[str, int] = {}
         
     # ------------------------------------------------------------------
     # Lifecycle
@@ -83,6 +86,28 @@ class BitgetBroker(BrokerAPI):
         if self.session is None:
             self.session = aiohttp.ClientSession(timeout=self.timeout)
             logger.info("BitgetBroker: async session initialized.")
+        
+        # [FIX] Загружаем правила торговли при старте
+        await self._refresh_symbol_rules()
+
+    async def _refresh_symbol_rules(self) -> None:
+        """Загружает точность (quantityPrecision) для всех пар."""
+        try:
+            # V2 Endpoint для публичной инфы
+            data = await self._request("GET", "/api/v2/spot/public/symbols", signed=False)
+            if not data: 
+                return
+            
+            # data - это список словарей
+            for item in data:
+                s = item.get("symbol", "")
+                # Bitget возвращает 'quantityPrecision' строкой или числом
+                p = int(item.get("quantityPrecision", 4)) 
+                self._symbol_rules[s] = p
+            
+            logger.info(f"Bitget: loaded rules for {len(self._symbol_rules)} symbols")
+        except Exception as e:
+            logger.error(f"Bitget: failed to load symbol rules: {e}")
 
     async def close(self) -> None:
         if self.session is not None:
@@ -1088,16 +1113,14 @@ class BitgetBroker(BrokerAPI):
         return results
     
     def normalize_qty(self, symbol: str, qty: float, price: float | None = None) -> float:
-        # P0: грубая нормализация под spot:
-        # - округляем до 6 знаков
-        # - отсекаем микроскопические значения
-        q = float(qty)
-        if q <= 0:
-            return 0.0
-        q = round(q, 6)
-        if q <= 0:
-            return 0.0
-        return q
+        # [FIX] Округление согласно правилам биржи
+        bg_symbol = self._to_bitget_symbol(symbol)
+        precision = self._symbol_rules.get(bg_symbol, 4) # Дефолт 4 знака, если не нашли
+        
+        # Используем форматирование строк для точного отсечения лишних знаков без округления вверх
+        # (floor rounding безопаснее для продажи, чтобы не превысить баланс)
+        fmt = f"{{:.{precision}f}}"
+        return float(fmt.format(qty))
 
     async def close_position(self, symbol: str, reason: str = "") -> None:
         # P0: spot close = SELL доступного количества монеты (base asset)
