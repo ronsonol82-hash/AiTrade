@@ -513,15 +513,62 @@ class AsyncStrategyRunner:
                 if be_sl > sl_price:
                     new_sl_candidate = be_sl
 
-        # 2) агрессивный трейл по хай-вотермарку, когда стоп “слишком далеко”
-        current_dist = cp - sl_price
+        # 2) агрессивный трейл (SQUEEZE LOGIC)
+        current_dist = abs(cp - sl_price)
         if current_dist > (atr * trigger_dist_atr):
-            trail_sl = max_price - (atr * trail_offset_atr)
-            trail_sl = min(trail_sl, cp - min_gap)
+            
+            # Достаем TP из protections
+            tp_price_val = _f(prot.get("tp"), 0.0)
+            base_offset = atr * trail_offset_atr
+            
+            # Если TP есть, считаем Squeeze (сжатие пружины)
+            if tp_price_val > 0:
+                if qty > 0: # LONG
+                    dist_remain = tp_price_val - max_price
+                    total_run = tp_price_val - entry_price
+                else: # SHORT
+                    dist_remain = max_price - tp_price_val
+                    total_run = entry_price - tp_price_val
+                
+                if total_run <= 0: squeeze_factor = 1.0
+                else: squeeze_factor = dist_remain / total_run
+                
+                # Клиппинг фактора (0..1)
+                squeeze_factor = max(0.0, min(1.0, squeeze_factor))
+                
+                # Динамический отступ: сужаем базу, но не меньше 10% от базы
+                dynamic_offset = base_offset * squeeze_factor
+                dynamic_offset = max(dynamic_offset, base_offset * 0.1)
+            else:
+                # Если TP нет (Moon Mode?), используем линейный отступ
+                dynamic_offset = base_offset
+
+            if qty > 0: # LONG
+                trail_sl = max_price - dynamic_offset
+                trail_sl = min(trail_sl, cp - min_gap) # Защита от пересечения цены
+                if new_sl_candidate is None: new_sl_candidate = trail_sl
+                else: new_sl_candidate = max(new_sl_candidate, trail_sl)
+            
+            else: # SHORT
+                trail_sl = max_price + dynamic_offset # Для шорта max_price это Low
+                trail_sl = max(trail_sl, cp + min_gap)
+                if new_sl_candidate is None: new_sl_candidate = trail_sl
+                else: new_sl_candidate = min(new_sl_candidate, trail_sl)
+
+            # Защита: стоп не должен пересекать цену (gap)
+            if qty > 0:
+                trail_sl = min(trail_sl, cp - min_gap)
+            else:
+                trail_sl = max(trail_sl, cp + min_gap)
+
             if new_sl_candidate is None:
                 new_sl_candidate = trail_sl
             else:
-                new_sl_candidate = max(new_sl_candidate, trail_sl)
+                # Для лонга тянем вверх (max), для шорта тянем вниз (min)
+                if qty > 0:
+                    new_sl_candidate = max(new_sl_candidate, trail_sl)
+                else:
+                    new_sl_candidate = min(new_sl_candidate, trail_sl)
 
         if new_sl_candidate is None:
             return False
@@ -986,6 +1033,39 @@ class AsyncStrategyRunner:
                 to_remove.append(symbol)
                 continue
 
+            # === [PATCH 3 START] TIME EXIT ===
+            try:
+                strat_params = Config.get_strategy_params()
+                max_hold_bars = int(strat_params.get("max_hold", 48))
+                
+                # Определяем секунды в баре
+                tf_str = getattr(Config, "TIMEFRAME_LTF", "4h")
+                tf_seconds = 3600 # Default 1h
+                if "4h" in tf_str: tf_seconds = 3600 * 4
+                elif "15m" in tf_str: tf_seconds = 60 * 15
+                elif "1d" in tf_str: tf_seconds = 86400
+                
+                max_seconds = max_hold_bars * tf_seconds
+                
+                created_at_str = prot.get("created_at")
+                if created_at_str:
+                    created_dt = datetime.fromisoformat(created_at_str.replace("Z", ""))
+                    age_seconds = (datetime.utcnow() - created_dt).total_seconds()
+                    
+                    if age_seconds > max_seconds:
+                        print(f"⏰ {symbol}: TIME EXIT triggered (Age: {age_seconds/3600:.1f}h > {max_seconds/3600:.1f}h)")
+                        exit_client_id = self._make_client_id(broker_name, symbol, "exit_time", prot.get("signal_id", "na"))
+                        
+                        if self.ledger.reserve_order(exit_client_id, broker=broker_name, symbol=symbol, role="time_exit", side="sell", payload={"reason": "time_exit"}):
+                            await self._router_execute_order(symbol=symbol, side="sell", quantity=qty, order_type="market", client_id=exit_client_id)
+                            if trade_id: self.ledger.close_trade(trade_id, current_price, "time_exit")
+                            to_remove.append(symbol)
+                            dirty = True
+                            continue 
+            except Exception as e:
+                print(f"[WARN] Time Exit check failed for {symbol}: {e}")
+            # === [PATCH 3 END] ===
+
             hit_sl = sl > 0 and current_price <= sl
             hit_tp = tp > 0 and current_price >= tp
             if not (hit_sl or hit_tp):
@@ -1234,10 +1314,35 @@ class AsyncStrategyRunner:
             print(f"✅ EXIT {symbol} done (qty={qty_to_close}, price={px})")
             return
 
-        # BUY
-        if self.ledger.has_open_trade(broker_name, symbol):
-            print(f"🧾 Ledger: уже есть open trade для {broker_name}:{symbol} → пропуск BUY")
-            return
+        # === [PATCH 1 START] PULLBACK LOGIC ===
+        # Эмуляция лимитного входа. Если цена хуже расчетной - пропускаем цикл.
+        try:
+            strat_params = Config.get_strategy_params()
+            pullback_mult = float(strat_params.get("pullback", 0.0))
+        except:
+            pullback_mult = 0.0
+
+        atr_val = float(signal_data.get("atr", 0.0) or 0.0)
+
+        # Проверяем только если pullback включен (>0)
+        if pullback_mult > 0.001 and atr_val > 0:
+            # Вариант "Строгий": требуем цену лучше, чем (Signal Close +/- Pullback)
+            sig_close = float(signal_data.get("close", current_price))
+            
+            if side == "buy":
+                target_price = sig_close - (atr_val * pullback_mult)
+                # Если мы ВЫШЕ цели (дороже) -> ждем
+                if current_price > target_price:
+                    print(f"⏳ {symbol} PULLBACK: Curr {current_price:.4f} > Target {target_price:.4f} (Wait)")
+                    return # Выходим, не отправляя ордер
+            
+            elif side == "sell":
+                target_price = sig_close + (atr_val * pullback_mult)
+                # Если мы НИЖЕ цели (дешевле) -> ждем
+                if current_price < target_price:
+                    print(f"⏳ {symbol} PULLBACK: Curr {current_price:.4f} < Target {target_price:.4f} (Wait)")
+                    return
+        # === [PATCH 1 END] ===
 
         broker_state = await broker.get_account_state()
         equity = float(getattr(broker_state, "equity", 0.0) or 0.0)
