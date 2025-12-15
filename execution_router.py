@@ -199,7 +199,10 @@ class ExecutionRouter:
         mode = mode_obj.value if isinstance(mode_obj, ExecutionMode) else str(mode_obj).lower()
 
         if mode == "live":
-            await self._check_daily_drawdown_guard()
+            # DD-guard должен блокировать только риск-увеличивающие ордера (входы),
+            # но НЕ мешать закрытию позиций.
+            if str(side).lower() in {"buy"}:
+                await self._check_daily_drawdown_guard()
 
         if quantity <= 0:
             raise ValueError("ExecutionRouter.execute_order: quantity must be > 0")

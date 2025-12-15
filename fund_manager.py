@@ -3,6 +3,7 @@ import sys
 import os
 import json
 import asyncio
+import time
 import numpy as np
 import pandas as pd
 import pyqtgraph as pg
@@ -14,12 +15,14 @@ from PyQt5.QtWidgets import (
     QWidget, QLabel, QComboBox, QGroupBox, QTabWidget, QPushButton,
     QTextEdit, QSplitter, QDoubleSpinBox, QGridLayout, QFrame, QSlider,
     QTableWidget, QHeaderView, QTableWidgetItem, QRadioButton, QCheckBox,
-    QTableView,                    # <-- добавили
+    QTableView,
+    QScrollArea, QProxyStyle, QStyle,   # <-- NEW
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QObject, QTimer
 from PyQt5.QtGui import (
     QPainter, QPicture, QColor, QFont,
-    QStandardItemModel, QStandardItem   # <-- добавили
+    QStandardItemModel, QStandardItem,
+    QPen,                                # <-- NEW
 )
 from async_strategy_runner import AsyncStrategyRunner
 
@@ -30,25 +33,154 @@ from indicators import FeatureEngineer
 from execution_router import ExecutionRouter
 
 # ==========================================
-# 🎨 GLOBAL STYLESHEET (PROFESSIONAL DARK)
+# 🎨 GLOBAL STYLESHEET (PROFESSIONAL DARK FIXED)
 # ==========================================
 STYLESHEET = """
-QMainWindow { background-color: #1e1e1e; color: #d4d4d4; }
-QWidget { font-family: 'Segoe UI', sans-serif; font-size: 10pt; color: #d4d4d4; }
+QMainWindow { background-color: #1e1e1e; color: #e0e0e0; }
+QWidget { font-family: 'Segoe UI', sans-serif; font-size: 10pt; color: #e0e0e0; }
+
+/* --- TABS --- */
 QTabWidget::pane { border: 1px solid #333333; background-color: #252526; }
 QTabWidget::tab-bar { left: 5px; }
 QTabBar::tab { background: #2d2d2d; color: #888888; padding: 8px 20px; margin-right: 2px; min-width: 100px; }
 QTabBar::tab:selected { background: #3e3e3e; color: #ffffff; border-bottom: 2px solid #007acc; font-weight: bold; }
+
+/* --- GROUPS --- */
 QGroupBox { border: 1px solid #3e3e3e; border-radius: 4px; margin-top: 20px; background-color: #252526; font-weight: bold; }
-QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; background-color: #252526; }
+QGroupBox::title { subcontrol-origin: margin; left: 10px; padding: 0 5px; background-color: #252526; color: #cccccc; }
+
+/* --- BUTTONS --- */
 QPushButton { background-color: #3c3c3c; border: 1px solid #555555; color: #ffffff; padding: 6px 12px; border-radius: 3px; }
 QPushButton:hover { background-color: #4a4a4a; border-color: #007acc; }
+QPushButton:pressed { background-color: #333333; }
 QPushButton#ActionBtn { background-color: #0e639c; border: 1px solid #1177bb; font-weight: bold; }
 QPushButton#ActionBtn:hover { background-color: #1177bb; }
-QTableWidget { gridline-color: #444; background-color: #1e1e1e; selection-background-color: #007acc; }
-QHeaderView::section { background-color: #2d2d2d; padding: 4px; border: 1px solid #444; }
+QPushButton#DiagBtn { background-color: #2d2d2d; border: 1px solid #444; color: #aaa; }
+QPushButton#DiagBtn:hover { background-color: #3d3d3d; color: #fff; }
+
+/* --- TEXT EDIT --- */
 QTextEdit { background-color: #1e1e1e; color: #d4d4d4; border: 1px solid #333333; font-family: 'Consolas', monospace; }
+
+/* --- INPUTS FIX (Make them DARK with LIGHT text) --- */
+QLineEdit,
+QComboBox,
+QSpinBox,
+QDoubleSpinBox,
+QAbstractSpinBox {
+    background-color: #2d2d2d;  /* Темно-серый фон вместо белого */
+    color: #ffffff;             /* Белый текст */
+    border: 1px solid #454545;
+    padding: 4px 6px;
+    border-radius: 3px;
+    selection-background-color: #007acc;
+    selection-color: #ffffff;
+}
+
+/* Фикс для внутреннего поля ввода спинбокса, чтобы оно не было белым */
+QSpinBox QLineEdit, 
+QDoubleSpinBox QLineEdit, 
+QAbstractSpinBox QLineEdit {
+    background-color: transparent;
+    color: #ffffff;
+    border: none;
+}
+
+/* При наведении подсвечиваем границы */
+QLineEdit:hover, QComboBox:hover, QSpinBox:hover, QDoubleSpinBox:hover {
+    border: 1px solid #007acc;
+}
+
+/* Выпадающий список комбобокса */
+QComboBox QAbstractItemView {
+    background-color: #252526;
+    color: #ffffff;
+    border: 1px solid #454545;
+    selection-background-color: #0e639c;
+    selection-color: #ffffff;
+}
+
+/* Disabled state - чтобы было видно, что отключено */
+QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabled {
+    background-color: #1e1e1e;
+    color: #555555;
+    border: 1px solid #333333;
+}
+
+/* --- TABLES --- */
+QTableWidget, QTableView {
+    background-color: #1e1e1e;
+    color: #d4d4d4;
+    gridline-color: #333333;
+    selection-background-color: #0e639c;
+    selection-color: #ffffff;
+    alternate-background-color: #252526;
+    border: none;
+}
+QHeaderView::section {
+    background-color: #2d2d2d;
+    color: #cccccc;
+    padding: 4px;
+    border: 1px solid #333333;
+}
+QCornerButton::section { background-color: #2d2d2d; border: none; }
+
+/* --- SCROLLBARS (Optional styling for complete look) --- */
+QScrollBar:vertical { border: none; background: #1e1e1e; width: 10px; margin: 0; }
+QScrollBar::handle:vertical { background: #444; min-height: 20px; border-radius: 5px; }
+QScrollBar::add-line:vertical, QScrollBar::sub-line:vertical { height: 0; }
 """
+
+class BlackIndicatorStyle(QProxyStyle):
+    """
+    Делает чёрные галочки (checkbox) и чёрную точку (radio),
+    чтобы на белом индикаторе всё было видно.
+    """
+    def drawPrimitive(self, element, option, painter, widget=None):
+        if element == QStyle.PE_IndicatorCheckBox:
+            r = option.rect.adjusted(1, 1, -1, -1)
+
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing, True)
+
+            # белый бокс + чёрная рамка
+            painter.setPen(QColor("#000000"))
+            painter.setBrush(QColor("#ffffff"))
+            painter.drawRect(r)
+
+            # checked -> чёрная галочка
+            if option.state & QStyle.State_On:
+                pen = QPen(QColor("#000000"), max(2, int(r.height() * 0.14)))
+                painter.setPen(pen)
+                x = r.x(); y = r.y(); w = r.width(); h = r.height()
+                painter.drawLine(int(x + w*0.20), int(y + h*0.55), int(x + w*0.42), int(y + h*0.75))
+                painter.drawLine(int(x + w*0.42), int(y + h*0.75), int(x + w*0.80), int(y + h*0.30))
+
+            painter.restore()
+            return
+
+        if element == QStyle.PE_IndicatorRadioButton:
+            r = option.rect.adjusted(1, 1, -1, -1)
+
+            painter.save()
+            painter.setRenderHint(QPainter.Antialiasing, True)
+
+            # внешний круг: белый + чёрная рамка
+            painter.setPen(QColor("#000000"))
+            painter.setBrush(QColor("#ffffff"))
+            painter.drawEllipse(r)
+
+            # checked -> чёрная точка
+            if option.state & QStyle.State_On:
+                inner = r.adjusted(int(r.width()*0.30), int(r.height()*0.30),
+                                   -int(r.width()*0.30), -int(r.height()*0.30))
+                painter.setPen(Qt.NoPen)
+                painter.setBrush(QColor("#000000"))
+                painter.drawEllipse(inner)
+
+            painter.restore()
+            return
+
+        super().drawPrimitive(element, option, painter, widget)
 
 pg.setConfigOption('background', '#1e1e1e')
 pg.setConfigOption('foreground', '#888888')
@@ -466,9 +598,36 @@ class FundManagerWindow(QMainWindow):
     # ------------------------------------------
     def create_control_tab(self):
         tab = QWidget()
-        layout = QHBoxLayout(tab)
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setStyleSheet("""
+        QScrollArea {
+            background-color: #1e1e1e;
+            border: none;
+        }
+        QScrollArea > QWidget > QWidget {
+            background-color: #1e1e1e;  /* именно фон “холста”, не всех детей */
+        }
+        """)
+
+        # NEW: тёмный фон скролла и viewport
+        scroll.setStyleSheet("background-color: #1e1e1e;")
+        scroll.viewport().setStyleSheet("background-color: #1e1e1e;")
+
+        content = QWidget()
+        # NEW: тёмный фон под всеми группами/пустыми зонами
+        content.setStyleSheet("background-color: #1e1e1e;")
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(20, 20, 20, 20)
-        layout.setSpacing(20)
+        layout.setSpacing(15)
+
+        scroll.setWidget(content)
+        tab_layout.addWidget(scroll)
         
         # --- LEFT: GENOME SETTINGS ---
         settings_group = QGroupBox("OPTIMIZER CONFIGURATION (GENOME)")
@@ -1262,9 +1421,28 @@ class FundManagerWindow(QMainWindow):
         - Пока работает как placeholder (DISCONNECTED).
         """        
         tab = QWidget()
-        layout = QVBoxLayout(tab)
+        tab_layout = QVBoxLayout(tab)
+        tab_layout.setContentsMargins(0, 0, 0, 0)
+        tab_layout.setSpacing(0)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+
+        # NEW: тёмный фон скролла и viewport
+        scroll.setStyleSheet("background-color: #1e1e1e;")
+        scroll.viewport().setStyleSheet("background-color: #1e1e1e;")
+
+        content = QWidget()
+        # NEW: тёмный фон под всеми группами/пустыми зонами
+        content.setStyleSheet("background-color: #1e1e1e;")
+        layout = QVBoxLayout(content)
         layout.setContentsMargins(20, 20, 20, 20)
         layout.setSpacing(15)
+
+        scroll.setWidget(content)
+        tab_layout.addWidget(scroll)
 
         # --- Верхняя строка статуса ---
         self.lbl_live_status = QLabel("LIVE MONITOR v1 — DISCONNECTED")
@@ -1293,7 +1471,66 @@ class FundManagerWindow(QMainWindow):
         btn_refresh_live.clicked.connect(self.refresh_live_monitor_snapshot)
         info_grid.addWidget(btn_refresh_live, 0, 2, 2, 1)  # Занимает 2 строки
 
+        # --- NEW: LIVE ARMED banner + link quality LEDs + health labels ---
+        self.lbl_live_arm_banner = QLabel("LIVE: —")
+        self.lbl_live_arm_banner.setAlignment(Qt.AlignCenter)
+        self.lbl_live_arm_banner.setMinimumHeight(26)
+        self.lbl_live_arm_banner.setStyleSheet(
+            "font-weight: 700; border-radius: 6px; padding: 6px; background: #2d2d2d;"
+        )
+        info_grid.addWidget(self.lbl_live_arm_banner, 2, 0, 1, 2)
+
+        # --- NEW: 3 лампочки (green/yellow/red) ---
+        self.led_live_green = QLabel()
+        self.led_live_yellow = QLabel()
+        self.led_live_red = QLabel()
+
+        for led in (self.led_live_green, self.led_live_yellow, self.led_live_red):
+            led.setFixedSize(14, 14)
+            led.setStyleSheet("background: #444444; border-radius: 7px; border: 1px solid #222222;")
+
+        led_row = QHBoxLayout()
+        led_row.setContentsMargins(0, 0, 0, 0)
+        led_row.setSpacing(6)
+        led_row.addWidget(QLabel("LINK:"))
+        led_row.addWidget(self.led_live_green)
+        led_row.addWidget(self.led_live_yellow)
+        led_row.addWidget(self.led_live_red)
+        led_row.addStretch()
+        info_grid.addLayout(led_row, 2, 2, 1, 1)
+
+        # --- NEW: last refresh / latency / health ---
+        self.lbl_live_last_refresh = QLabel("Last refresh: —")
+        self.lbl_live_latency = QLabel("Latency: —")
+        self.lbl_live_broker_health = QLabel("Health: —")
+
+        info_grid.addWidget(self.lbl_live_last_refresh, 3, 0, 1, 1)
+        info_grid.addWidget(self.lbl_live_latency, 3, 1, 1, 1)
+        info_grid.addWidget(self.lbl_live_broker_health, 4, 0, 1, 2)
+
         layout.addWidget(account_group)
+
+        # 1b) LIVE CONTROLS (KILL / CANCEL / RECONNECT)
+        controls_group = QGroupBox("LIVE CONTROLS (EMERGENCY)")
+        ctrl_row = QHBoxLayout(controls_group)
+
+        self.btn_live_kill_close_all = QPushButton("🧨 KILL: CLOSE ALL POSITIONS")
+        self.btn_live_cancel_all = QPushButton("🧹 CANCEL ALL ORDERS")
+        self.btn_live_kill_drill = QPushButton("🧪 KILL DRILL (SIMULATE)")
+        self.btn_live_reconnect = QPushButton("🔌 RECONNECT / RE-INIT ROUTER")
+
+        self.btn_live_kill_close_all.clicked.connect(self.on_live_kill_close_all_positions)
+        self.btn_live_cancel_all.clicked.connect(self.on_live_cancel_all_orders)
+        self.btn_live_kill_drill.clicked.connect(self.on_live_kill_switch_drill)
+        self.btn_live_reconnect.clicked.connect(self.on_live_reconnect_router)
+
+        ctrl_row.addWidget(self.btn_live_kill_close_all)
+        ctrl_row.addWidget(self.btn_live_cancel_all)
+        ctrl_row.addWidget(self.btn_live_kill_drill)
+        ctrl_row.addWidget(self.btn_live_reconnect)
+        ctrl_row.addStretch()
+
+        layout.addWidget(controls_group)
 
         # 1c) RISK CONTROL
         risk_group = QGroupBox("RISK CONTROL (LIVE/PAPER)")
@@ -1373,6 +1610,7 @@ class FundManagerWindow(QMainWindow):
         positions_group = QGroupBox("POSITIONS (LIVE)")
         pos_layout = QVBoxLayout(positions_group)
         
+        # --- POSITIONS ---
         self.tbl_live_positions = QTableView()
         self.model_live_positions = QStandardItemModel()
         self.model_live_positions.setHorizontalHeaderLabels([
@@ -1381,13 +1619,21 @@ class FundManagerWindow(QMainWindow):
         ])
         self.tbl_live_positions.setModel(self.model_live_positions)
         pos_layout.addWidget(self.tbl_live_positions)
-        
+
+        # POSITIONS table readability
+        self.tbl_live_positions.setAlternatingRowColors(True)
+        self.tbl_live_positions.setSelectionBehavior(QTableView.SelectRows)
+        self.tbl_live_positions.setEditTriggers(QTableView.NoEditTriggers)
+        self.tbl_live_positions.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tbl_live_positions.verticalHeader().setVisible(False)
+        self.tbl_live_positions.verticalHeader().setDefaultSectionSize(22)
+
         tables_layout.addWidget(positions_group)
 
-        # Оригинальная таблица ордеров (оставляем как было)
+        # --- ORDERS ---
         orders_group = QGroupBox("ORDERS (LIVE)")
         ord_layout = QVBoxLayout(orders_group)
-        
+
         self.tbl_orders = QTableWidget()
         self.tbl_orders.setColumnCount(7)
         self.tbl_orders.setHorizontalHeaderLabels([
@@ -1397,10 +1643,64 @@ class FundManagerWindow(QMainWindow):
         self.tbl_orders.setSelectionBehavior(self.tbl_orders.SelectRows)
         self.tbl_orders.setEditTriggers(self.tbl_orders.NoEditTriggers)
         ord_layout.addWidget(self.tbl_orders)
-        
+
+        # ✅ ORDERS table readability — теперь tbl_orders уже существует
+        self.tbl_orders.setAlternatingRowColors(True)
+        self.tbl_orders.verticalHeader().setVisible(False)
+        self.tbl_orders.verticalHeader().setDefaultSectionSize(22)
+
         tables_layout.addWidget(orders_group)
 
         layout.addWidget(tables_container, stretch=2)
+
+        # 2b) SIGNALS + PROTECTIONS (mini panels)
+        hp_container = QWidget()
+        hp_layout = QHBoxLayout(hp_container)
+        hp_layout.setContentsMargins(0, 0, 0, 0)
+        hp_layout.setSpacing(10)
+
+        # --- Signals mini panel ---
+        signal_group = QGroupBox("SIGNALS / ATR / BLOCK REASONS")
+        sig_layout = QVBoxLayout(signal_group)
+
+        self.tbl_signal_health = QTableWidget()
+        self.tbl_signal_health.setColumnCount(6)
+        self.tbl_signal_health.setHorizontalHeaderLabels(["Symbol", "p_long", "p_short", "Regime", "ATR", "Block"])
+        self.tbl_signal_health.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tbl_signal_health.setEditTriggers(self.tbl_signal_health.NoEditTriggers)
+        self.tbl_signal_health.setSelectionBehavior(self.tbl_signal_health.SelectRows)
+        sig_layout.addWidget(self.tbl_signal_health)
+
+        # --- Protections inspector ---
+        prot_group = QGroupBox("PROTECTIONS INSPECTOR")
+        prot_layout = QVBoxLayout(prot_group)
+
+        self.lbl_prot_status = QLabel("protections: —")
+        self.lbl_prot_status.setWordWrap(True)
+        prot_layout.addWidget(self.lbl_prot_status)
+
+        prot_btn_row = QHBoxLayout()
+        self.btn_prot_open = QPushButton("OPEN FILE")
+        self.btn_prot_validate = QPushButton("VALIDATE")
+        self.btn_prot_open.clicked.connect(self.open_protections_file)
+        self.btn_prot_validate.clicked.connect(self.validate_protections_file)
+        prot_btn_row.addWidget(self.btn_prot_open)
+        prot_btn_row.addWidget(self.btn_prot_validate)
+        prot_btn_row.addStretch()
+        prot_layout.addLayout(prot_btn_row)
+
+        self.tbl_protections = QTableWidget()
+        self.tbl_protections.setColumnCount(5)
+        self.tbl_protections.setHorizontalHeaderLabels(["Key", "Mode", "SL", "TP", "Notes"])
+        self.tbl_protections.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.tbl_protections.setEditTriggers(self.tbl_protections.NoEditTriggers)
+        self.tbl_protections.setSelectionBehavior(self.tbl_protections.SelectRows)
+        prot_layout.addWidget(self.tbl_protections)
+
+        hp_layout.addWidget(signal_group, stretch=2)
+        hp_layout.addWidget(prot_group, stretch=1)
+
+        layout.addWidget(hp_container)
 
         # 3) LIVE EVENT LOG - оригинальный лог
         live_log_group = QGroupBox("LIVE EVENTS")
@@ -1414,10 +1714,7 @@ class FundManagerWindow(QMainWindow):
 
         # Первичная инициализация
         self.refresh_live_monitor_snapshot()
-        self.live_log.append(
-            "Live monitor is not connected to an exchange yet.\n"
-            "Wire your ExchangeClient implementation into refresh_live_monitor_snapshot()."
-        )
+        self.live_log.append("[LIVE] Live monitor initialized. Waiting for first snapshot...")
 
         return tab
 
@@ -1592,110 +1889,99 @@ class FundManagerWindow(QMainWindow):
 
     def refresh_live_monitor_snapshot(self):
         """
-        Обновляет LIVE MONITOR, используя ExecutionRouter:
-        - агрегированный equity/balance и PnL по брокерам;
-        - список открытых позиций;
-        - обновляет equity-кривую за сессию.
-
-        Все async-вызовы идут через self._async_loop, чтобы не блокировать GUI.
+        LIVE MONITOR (production-ready):
+        - router.initialize() once
+        - get_global_account_state()
+        - list_all_positions()
+        - fetch open orders (best-effort)
+        - update banner/LEDs/health/latency/last refresh
+        - mini panels: signals/atr/block reasons + protections inspector
         """
         import asyncio
+        import time
+        import os
+        import json
+        from datetime import datetime
         from config import ExecutionMode
 
-        # 0) Если роутера нет – показываем DISCONNECTED и чистим UI
+        def _now_str():
+            return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        def _fmt_age(dt_obj):
+            if not dt_obj:
+                return "—"
+            try:
+                delta = datetime.now() - dt_obj
+                sec = int(delta.total_seconds())
+                if sec < 60:
+                    return f"{sec}s"
+                if sec < 3600:
+                    return f"{sec//60}m"
+                return f"{sec//3600}h {((sec % 3600)//60)}m"
+            except Exception:
+                return "—"
+
         router = getattr(self, "execution_router", None)
         if router is None:
             if hasattr(self, "lbl_live_status"):
                 self.lbl_live_status.setText("LIVE MONITOR v1 — DISCONNECTED")
-            if hasattr(self, "lbl_live_equity"):
-                self.lbl_live_equity.setText("Total Equity: —")
-            if hasattr(self, "lbl_live_pnl"):
-                self.lbl_live_pnl.setText("Total PnL: —")
-            if hasattr(self, "lbl_live_bitget"):
-                self.lbl_live_bitget.setText("Bitget: —")
-            if hasattr(self, "lbl_live_tinkoff"):
-                self.lbl_live_tinkoff.setText("Tinkoff: —")
-            if hasattr(self, "model_live_positions"):
-                self.model_live_positions.removeRows(
-                    0, self.model_live_positions.rowCount()
-                )
             if hasattr(self, "tbl_orders"):
                 self.tbl_orders.setRowCount(0)
             if hasattr(self, "live_equity_plot"):
                 self.live_equity_plot.clear()
             return
 
-        # 1) В режиме BACKTEST монитор не трогаем
+        # режим BACKTEST — монитор не трогаем
         mode_obj = getattr(Config, "EXECUTION_MODE", ExecutionMode.BACKTEST)
-        if isinstance(mode_obj, ExecutionMode):
-            mode = mode_obj
-        else:
-            try:
-                mode = ExecutionMode(mode_obj)
-            except Exception:
-                mode = ExecutionMode.BACKTEST
-
+        try:
+            mode = mode_obj if isinstance(mode_obj, ExecutionMode) else ExecutionMode(mode_obj)
+        except Exception:
+            mode = ExecutionMode.BACKTEST
         if mode == ExecutionMode.BACKTEST:
             return
 
-        # 2) Проверяем event loop
         loop = getattr(self, "_async_loop", None)
         if loop is None:
             return
 
-        # 3) Однократная инициализация брокеров
+        t0 = time.perf_counter()
+        err_text = None
+
+        # init once
         if not getattr(self, "_router_initialized", False):
             try:
-                fut_init = asyncio.run_coroutine_threadsafe(
-                    router.initialize(),
-                    loop,
-                )
-                fut_init.result(timeout=10.0)
+                fut_init = asyncio.run_coroutine_threadsafe(router.initialize(), loop)
+                fut_init.result(timeout=12.0)
                 self._router_initialized = True
             except Exception as e:
+                err_text = f"Router init failed: {e}"
                 if hasattr(self, "lbl_live_status"):
-                    self.lbl_live_status.setText("LIVE MONITOR v1 — ERROR (init)")
+                    self.lbl_live_status.setText("LIVE MONITOR — ERROR (init)")
                 if hasattr(self, "live_log"):
-                    self.live_log.append(f"[ERROR] Router init failed: {e}")
+                    self.live_log.append(f"[ERROR] {err_text}")
+                self._update_live_health_ui(ok=False, latency_ms=None, details=None, err=err_text)
                 return
 
-        # 4) Тянем агрегированное состояние счёта
+        # state
         try:
-            fut_state = asyncio.run_coroutine_threadsafe(
-                router.get_global_account_state(),
-                loop,
-            )
-            state = fut_state.result(timeout=5.0)
+            fut_state = asyncio.run_coroutine_threadsafe(router.get_global_account_state(), loop)
+            state = fut_state.result(timeout=6.0)
         except Exception as e:
+            err_text = f"Account snapshot failed: {e}"
             if hasattr(self, "lbl_live_status"):
-                self.lbl_live_status.setText("LIVE MONITOR v1 — ERROR (state)")
-            if hasattr(self, "lbl_live_equity"):
-                self.lbl_live_equity.setText("Total Equity: ERR")
-            if hasattr(self, "lbl_live_pnl"):
-                self.lbl_live_pnl.setText("Total PnL: ERR")
-            if hasattr(self, "lbl_live_bitget"):
-                self.lbl_live_bitget.setText("Bitget: ERR")
-            if hasattr(self, "lbl_live_tinkoff"):
-                self.lbl_live_tinkoff.setText("Tinkoff: ERR")
-            if hasattr(self, "model_live_positions"):
-                self.model_live_positions.removeRows(
-                    0, self.model_live_positions.rowCount()
-                )
-            if hasattr(self, "tbl_orders"):
-                self.tbl_orders.setRowCount(0)
+                self.lbl_live_status.setText("LIVE MONITOR — ERROR (state)")
             if hasattr(self, "live_log"):
-                self.live_log.append(f"[ERROR] Failed to refresh account snapshot: {e}")
+                self.live_log.append(f"[ERROR] {err_text}")
+            self._update_live_health_ui(ok=False, latency_ms=int((time.perf_counter()-t0)*1000), details=None, err=err_text)
             return
 
-        # ---- 4a. Агрегаты по счёту ----
+        # aggregates
         total_equity = float(getattr(state, "equity", 0.0) or 0.0)
-
         total_upnl = 0.0
         bitget_eq = bitget_upnl = 0.0
         tink_eq = tink_upnl = 0.0
 
         details = getattr(state, "details", {}) or {}
-
         for name, st in details.items():
             eq = float(getattr(st, "equity", 0.0) or 0.0)
             upnl = float(getattr(st, "unrealized_pnl", 0.0) or 0.0)
@@ -1709,76 +1995,62 @@ class FundManagerWindow(QMainWindow):
                 tink_eq += eq
                 tink_upnl += upnl
 
-        # ---- 4b. Обновляем верхние лейблы ----
+        # positions
+        try:
+            fut_pos = asyncio.run_coroutine_threadsafe(router.list_all_positions(), loop)
+            positions = fut_pos.result(timeout=6.0)
+        except Exception as e:
+            err_text = f"Positions fetch failed: {e}"
+            if hasattr(self, "live_log"):
+                self.live_log.append(f"[ERROR] {err_text}")
+            positions = []
+
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+
+        # --- top labels ---
         if hasattr(self, "lbl_live_status"):
-            self.lbl_live_status.setText("LIVE MONITOR v1 — CONNECTED")
+            self.lbl_live_status.setText(f"LIVE MONITOR — CONNECTED ({mode.value.upper()})")
 
         if hasattr(self, "lbl_live_equity"):
             self.lbl_live_equity.setText(f"Total Equity: {total_equity:,.2f}")
-
         if hasattr(self, "lbl_live_pnl"):
             self.lbl_live_pnl.setText(f"Total PnL: {total_upnl:,.2f}")
 
         if hasattr(self, "lbl_live_bitget"):
             if bitget_eq > 0.0 or bitget_upnl != 0.0:
-                self.lbl_live_bitget.setText(
-                    f"Bitget: eq={bitget_eq:,.2f}, uPnL={bitget_upnl:,.2f}"
-                )
+                self.lbl_live_bitget.setText(f"Bitget: eq={bitget_eq:,.2f}, uPnL={bitget_upnl:,.2f}")
             else:
                 self.lbl_live_bitget.setText("Bitget: —")
 
         if hasattr(self, "lbl_live_tinkoff"):
             if tink_eq > 0.0 or tink_upnl != 0.0:
-                self.lbl_live_tinkoff.setText(
-                    f"Tinkoff: eq={tink_eq:,.2f}, uPnL={tink_upnl:,.2f}"
-                )
+                self.lbl_live_tinkoff.setText(f"Tinkoff: eq={tink_eq:,.2f}, uPnL={tink_upnl:,.2f}")
             else:
                 self.lbl_live_tinkoff.setText("Tinkoff: —")
 
-        # 5) Equity-кривая за сессию
+        # equity curve
         try:
             if not hasattr(self, "live_equity_history"):
                 self.live_equity_history = []
             t_idx = len(self.live_equity_history)
             self.live_equity_history.append((t_idx, total_equity))
-
             if hasattr(self, "live_equity_plot") and len(self.live_equity_history) >= 2:
                 xs = np.array([t for (t, _) in self.live_equity_history], dtype=float)
                 ys = np.array([v for (_, v) in self.live_equity_history], dtype=float)
                 self.live_equity_plot.clear()
                 self.live_equity_plot.plot(xs, ys, pen=pg.mkPen('#26a69a', width=2))
         except Exception as e:
-            print(f"[LIVE] Failed to update equity curve: {e}")
-
-        # 6) Позиции → POSITIONS (LIVE)
-        try:
-            fut_pos = asyncio.run_coroutine_threadsafe(
-                router.list_all_positions(),
-                loop,
-            )
-            positions = fut_pos.result(timeout=5.0)
-        except Exception as e:
-            if hasattr(self, "model_live_positions"):
-                self.model_live_positions.removeRows(
-                    0, self.model_live_positions.rowCount()
-                )
-            if hasattr(self, "tbl_orders"):
-                self.tbl_orders.setRowCount(0)
             if hasattr(self, "live_log"):
-                self.live_log.append(f"[ERROR] Failed to fetch positions: {e}")
-            return
+                self.live_log.append(f"[WARN] Equity curve update failed: {e}")
 
+        # positions table
         if hasattr(self, "model_live_positions"):
-            # очистить таблицу
-            self.model_live_positions.removeRows(
-                0, self.model_live_positions.rowCount()
-            )
-
+            self.model_live_positions.removeRows(0, self.model_live_positions.rowCount())
             from PyQt5.QtGui import QColor, QStandardItem
 
             for p in positions or []:
-                symbol = getattr(p, "symbol", "")
-                broker_name = getattr(p, "broker", "")
+                symbol = str(getattr(p, "symbol", "") or "")
+                broker_name = str(getattr(p, "broker", "") or "")
                 qty = float(getattr(p, "quantity", 0.0) or 0.0)
                 avg_price = float(getattr(p, "avg_price", 0.0) or 0.0)
                 last_price = float(getattr(p, "last_price", avg_price) or 0.0)
@@ -1787,13 +2059,12 @@ class FundManagerWindow(QMainWindow):
                 side = "LONG" if qty > 0 else "SHORT"
                 size_abs = abs(qty)
 
+                upnl_pct = 0.0
                 if avg_price > 0 and size_abs > 0:
                     try:
                         upnl_pct = (upnl / (avg_price * size_abs)) * 100.0
                     except ZeroDivisionError:
                         upnl_pct = 0.0
-                else:
-                    upnl_pct = 0.0
 
                 color = None
                 if upnl > 0:
@@ -1802,8 +2073,8 @@ class FundManagerWindow(QMainWindow):
                     color = QColor("#ef5350")
 
                 row_values = [
-                    str(broker_name),
-                    str(symbol),
+                    broker_name,
+                    symbol,
                     side,
                     f"{size_abs:.4f}",
                     f"{avg_price:,.4f}",
@@ -1811,25 +2082,660 @@ class FundManagerWindow(QMainWindow):
                     f"{upnl:,.2f}",
                     f"{upnl_pct:,.2f}%",
                 ]
-
                 items = [QStandardItem(text) for text in row_values]
                 if color is not None and len(items) >= 8:
-                    # Подсветим PnL и PnL %
                     items[6].setForeground(color)
                     items[7].setForeground(color)
-
                 self.model_live_positions.appendRow(items)
 
-        # 7) Таблица ордеров — пока заглушка
-        if hasattr(self, "tbl_orders"):
-            self.tbl_orders.setRowCount(0)
+        # --- OPEN ORDERS (REAL) ---
+        orders_all = []
+        try:
+            brokers = getattr(router, "_brokers", {}) or {}
+            # symbols to query: positions first, fallback first 10 selected assets
+            pos_syms = []
+            for p in positions or []:
+                s = getattr(p, "symbol", None)
+                if s:
+                    pos_syms.append(str(s))
+            symbols = list(dict.fromkeys(pos_syms))  # unique preserving order
+            if not symbols:
+                try:
+                    symbols = (self.get_selected_assets() or [])[:10]
+                except Exception:
+                    symbols = []
 
-        # 8) Краткий лог-снимок
+            async def _fetch_orders():
+                out = []
+                for bname, broker in brokers.items():
+                    for sym in symbols:
+                        try:
+                            lst = await broker.get_open_orders(sym)
+                        except NotImplementedError:
+                            continue
+                        except Exception:
+                            continue
+                        for o in lst or []:
+                            out.append(o)
+                return out
+
+            if brokers and symbols:
+                fut_orders = asyncio.run_coroutine_threadsafe(_fetch_orders(), loop)
+                orders_all = fut_orders.result(timeout=6.0) or []
+        except Exception as e:
+            if hasattr(self, "live_log"):
+                self.live_log.append(f"[WARN] Open orders fetch failed: {e}")
+
+        if hasattr(self, "tbl_orders"):
+            self.tbl_orders.setRowCount(len(orders_all))
+            for r, o in enumerate(orders_all):
+                sym = str(getattr(o, "symbol", "") or "")
+                broker_tag = str(getattr(o, "broker", "") or "")  # кладём в колонку Type
+                side = str(getattr(o, "side", "") or "")
+                price = float(getattr(o, "price", 0.0) or 0.0)
+                qty = float(getattr(o, "quantity", 0.0) or 0.0)
+                status = str(getattr(o, "status", "") or "")
+                ct = getattr(o, "create_time", None)
+
+                self.tbl_orders.setItem(r, 0, QTableWidgetItem(sym))
+                self.tbl_orders.setItem(r, 1, QTableWidgetItem(broker_tag or "—"))
+                self.tbl_orders.setItem(r, 2, QTableWidgetItem(side or "—"))
+                self.tbl_orders.setItem(r, 3, QTableWidgetItem(f"{price:,.4f}"))
+                self.tbl_orders.setItem(r, 4, QTableWidgetItem(f"{qty:,.6f}"))
+                self.tbl_orders.setItem(r, 5, QTableWidgetItem(status or "—"))
+                self.tbl_orders.setItem(r, 6, QTableWidgetItem(_fmt_age(ct)))
+
+        # --- health UI (banner/leds/latency/last refresh) ---
+        self._update_live_health_ui(ok=True, latency_ms=latency_ms, details=details, err=None)
+
+        # --- mini panels (best-effort, non-blocking) ---
+        self._refresh_signal_health_panel_best_effort(positions=positions, mode=mode, total_equity=total_equity)
+        self._refresh_protections_panel_best_effort()
+
+        # краткий лог
         if hasattr(self, "live_log"):
             self.live_log.append(
-                f"[SNAPSHOT] Equity: {total_equity:,.2f} | uPnL: {total_upnl:,.2f} | "
-                f"Positions: {len(positions) if positions is not None else 0}"
+                f"[SNAPSHOT] { _now_str() } | Equity: {total_equity:,.2f} | uPnL: {total_upnl:,.2f} | "
+                f"Pos: {len(positions) if positions is not None else 0} | Orders: {len(orders_all)} | Latency: {latency_ms}ms"
             )
+
+    def _set_live_quality_leds(self, level: str):
+        """
+        level: 'green' | 'yellow' | 'red' | 'off'
+        """
+        def _led(led, on_color, enabled):
+            led.setStyleSheet(
+                f"background: {on_color if enabled else '#444444'}; "
+                f"border-radius: 7px; border: 1px solid #222222;"
+            )
+
+        if not (hasattr(self, "led_live_green") and hasattr(self, "led_live_yellow") and hasattr(self, "led_live_red")):
+            return
+
+        level = (level or "off").lower()
+        _led(self.led_live_green,  "#26a69a", level == "green")
+        _led(self.led_live_yellow, "#fbc02d", level == "yellow")
+        _led(self.led_live_red,    "#ef5350", level == "red")
+
+
+    def _update_live_arm_banner_only(self):
+        from config import Config, ExecutionMode
+
+        mode_obj = getattr(Config, "EXECUTION_MODE", ExecutionMode.BACKTEST)
+        mode = mode_obj.value if hasattr(mode_obj, "value") else str(mode_obj).lower()
+        mode = str(mode).lower()
+        armed = bool(getattr(Config, "ALLOW_LIVE", False))
+
+        if not hasattr(self, "lbl_live_arm_banner"):
+            return
+
+        if mode != "live":
+            self.lbl_live_arm_banner.setText(f"MODE: {mode.upper()} (no real orders)")
+            self.lbl_live_arm_banner.setStyleSheet(
+                "font-weight: 700; border-radius: 6px; padding: 6px; background: #2d2d2d;"
+            )
+            return
+
+        if armed:
+            self.lbl_live_arm_banner.setText("LIVE ARMED ✅  (real trading enabled)")
+            self.lbl_live_arm_banner.setStyleSheet(
+                "font-weight: 800; border-radius: 6px; padding: 6px; background: #1f3d2f;"
+            )
+        else:
+            self.lbl_live_arm_banner.setText("LIVE DISARMED ⛔  (ALLOW_LIVE=false)")
+            self.lbl_live_arm_banner.setStyleSheet(
+                "font-weight: 800; border-radius: 6px; padding: 6px; background: #3b1f1f;"
+            )
+
+
+    def _apply_live_arm_guard(self):
+        """
+        Блокирует START TRADING SESSION в режиме LIVE, если ALLOW_LIVE выключен.
+        """
+        from config import Config, ExecutionMode
+
+        mode_obj = getattr(Config, "EXECUTION_MODE", ExecutionMode.BACKTEST)
+        mode = mode_obj.value if hasattr(mode_obj, "value") else str(mode_obj).lower()
+        mode = str(mode).lower()
+
+        armed = bool(getattr(Config, "ALLOW_LIVE", False))
+
+        if hasattr(self, "btn_start_trading"):
+            if mode == "live" and not armed:
+                self.btn_start_trading.setEnabled(False)
+                self.btn_start_trading.setToolTip("LIVE is disarmed. Enable ALLOW_LIVE in LIVE MONITOR → RISK CONTROL.")
+            else:
+                self.btn_start_trading.setEnabled(True)
+                self.btn_start_trading.setToolTip("")
+
+
+    def _update_live_health_ui(self, ok: bool, latency_ms: int | None, details: dict | None, err: str | None):
+        """
+        Обновляет:
+        - last refresh / latency / broker health
+        - banner LIVE armed
+        - 3 LED (green/yellow/red)
+        """
+        import time
+        from config import Config
+
+        # banner
+        self._update_live_arm_banner_only()
+        self._apply_live_arm_guard()
+
+        # labels
+        if hasattr(self, "lbl_live_last_refresh"):
+            self.lbl_live_last_refresh.setText(f"Last refresh: {datetime.now().strftime('%H:%M:%S')}")
+        if hasattr(self, "lbl_live_latency"):
+            self.lbl_live_latency.setText(f"Latency: {latency_ms} ms" if latency_ms is not None else "Latency: —")
+
+        # expected brokers by universe mode
+        need_crypto = True
+        need_stocks = True
+        try:
+            m = getattr(self, "current_universe_mode", Config.UNIVERSE_MODE)
+            mv = getattr(m, "value", str(m)).lower()
+            need_crypto = mv in ("crypto", "both")
+            need_stocks = mv in ("stocks", "both")
+        except Exception:
+            pass
+
+        bit_ok = False
+        tink_ok = False
+        if isinstance(details, dict):
+            for k in details.keys():
+                lk = str(k).lower()
+                if lk.startswith("bitget"):
+                    bit_ok = True
+                if lk.startswith("tinkoff"):
+                    tink_ok = True
+
+        health_parts = []
+        if need_crypto:
+            health_parts.append(f"Bitget={'OK' if bit_ok else 'MISS'}")
+        if need_stocks:
+            health_parts.append(f"Tinkoff={'OK' if tink_ok else 'MISS'}")
+        if err:
+            health_parts.append(f"ERR={err}")
+
+        if hasattr(self, "lbl_live_broker_health"):
+            self.lbl_live_broker_health.setText("Health: " + " | ".join(health_parts) if health_parts else "Health: —")
+
+        # LED logic
+        if not ok:
+            self._set_live_quality_leds("red")
+            return
+
+        # ok=True
+        # yellow if missing required broker or latency high
+        if (need_crypto and not bit_ok) or (need_stocks and not tink_ok):
+            self._set_live_quality_leds("yellow")
+            return
+        if latency_ms is not None and latency_ms > 2000:
+            self._set_live_quality_leds("yellow")
+            return
+
+        self._set_live_quality_leds("green")
+
+
+    def on_live_kill_close_all_positions(self):
+        """
+        KILL SWITCH: Close All Positions (через ExecutionRouter).
+        """
+        from PyQt5.QtWidgets import QMessageBox
+        import asyncio
+
+        reply = QMessageBox.question(
+            self,
+            "KILL SWITCH",
+            "Close ALL positions on ALL brokers?\nThis is irreversible.",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        loop = getattr(self, "_async_loop", None)
+        router = getattr(self, "execution_router", None)
+        if loop is None or router is None:
+            if hasattr(self, "live_log"):
+                self.live_log.append("[KILL] ERROR: async loop or router not ready.")
+            return
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                router.close_all_positions(reason="gui_kill_switch"),
+                loop,
+            )
+            fut.result(timeout=20.0)
+            if hasattr(self, "live_log"):
+                self.live_log.append("[KILL] Close all positions: DONE")
+        except Exception as e:
+            if hasattr(self, "live_log"):
+                self.live_log.append(f"[KILL] Close all positions: ERROR {e}")
+
+        self.refresh_live_monitor_snapshot()
+
+
+    def on_live_cancel_all_orders(self):
+        """
+        Cancel All Orders (через ExecutionRouter).
+        """
+        from PyQt5.QtWidgets import QMessageBox
+        import asyncio
+
+        reply = QMessageBox.question(
+            self,
+            "CANCEL ALL",
+            "Cancel ALL open orders on ALL brokers?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+
+        loop = getattr(self, "_async_loop", None)
+        router = getattr(self, "execution_router", None)
+        if loop is None or router is None:
+            if hasattr(self, "live_log"):
+                self.live_log.append("[CANCEL] ERROR: async loop or router not ready.")
+            return
+
+        try:
+            fut = asyncio.run_coroutine_threadsafe(
+                router.cancel_all_orders(symbols=None),
+                loop,
+            )
+            fut.result(timeout=20.0)
+            if hasattr(self, "live_log"):
+                self.live_log.append("[CANCEL] Cancel all orders: DONE")
+        except Exception as e:
+            if hasattr(self, "live_log"):
+                self.live_log.append(f"[CANCEL] Cancel all orders: ERROR {e}")
+
+        self.refresh_live_monitor_snapshot()
+
+    def on_live_kill_switch_drill(self):
+        """
+        KILL-SWITCH DRILL (SIMULATION ONLY):
+        - НЕ отменяет ордера
+        - НЕ закрывает позиции
+        - только проверяет, что router живой, и показывает, ЧТО БЫЛО БЫ сделано.
+        """
+        import asyncio
+        import time
+        from datetime import datetime
+
+        loop = getattr(self, "_async_loop", None)
+        router = getattr(self, "execution_router", None)
+
+        def log(msg: str):
+            if hasattr(self, "live_log"):
+                self.live_log.append(msg)
+            else:
+                print(msg)
+
+        if loop is None or router is None:
+            log("[DRILL] ❌ async loop or router not ready.")
+            try:
+                self._set_live_quality_leds("red")
+            except Exception:
+                pass
+            return
+
+        log("—" * 60)
+        log(f"[DRILL] 🧪 Kill-switch drill started @ {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+        t0 = time.perf_counter()
+
+        # 1) init router (safe: no trading)
+        if not getattr(self, "_router_initialized", False):
+            try:
+                fut_init = asyncio.run_coroutine_threadsafe(router.initialize(), loop)
+                fut_init.result(timeout=12.0)
+                self._router_initialized = True
+                log("[DRILL] Router initialize: OK")
+            except Exception as e:
+                log(f"[DRILL] ❌ Router initialize failed: {e}")
+                try:
+                    self._set_live_quality_leds("red")
+                except Exception:
+                    pass
+                return
+
+        # 2) positions
+        try:
+            fut_pos = asyncio.run_coroutine_threadsafe(router.list_all_positions(), loop)
+            positions = fut_pos.result(timeout=8.0) or []
+            log(f"[DRILL] Positions fetched: {len(positions)}")
+        except Exception as e:
+            log(f"[DRILL] ❌ Positions fetch failed: {e}")
+            positions = []
+
+        # 3) open orders (best-effort; no cancels)
+        orders_all = []
+        try:
+            brokers = getattr(router, "_brokers", {}) or {}
+
+            # symbols to query: positions first, fallback first 10 selected assets
+            pos_syms = []
+            for p in positions:
+                s = getattr(p, "symbol", None)
+                if s:
+                    pos_syms.append(str(s))
+            symbols = list(dict.fromkeys(pos_syms))
+            if not symbols:
+                try:
+                    symbols = (self.get_selected_assets() or [])[:10]
+                except Exception:
+                    symbols = []
+
+            async def _fetch_orders():
+                out = []
+                for bname, broker in brokers.items():
+                    for sym in symbols:
+                        try:
+                            lst = await broker.get_open_orders(sym)
+                        except NotImplementedError:
+                            continue
+                        except Exception:
+                            continue
+                        for o in lst or []:
+                            out.append(o)
+                return out
+
+            if brokers and symbols:
+                fut_orders = asyncio.run_coroutine_threadsafe(_fetch_orders(), loop)
+                orders_all = fut_orders.result(timeout=8.0) or []
+            log(f"[DRILL] Open orders fetched: {len(orders_all)}")
+        except Exception as e:
+            log(f"[DRILL] ⚠️ Open orders fetch failed (non-fatal): {e}")
+
+        latency_ms = int((time.perf_counter() - t0) * 1000)
+
+        # 4) what would happen (simulation)
+        log("[DRILL] ✅ SIMULATION RESULT (no actions executed):")
+
+        if orders_all:
+            log(f"[DRILL] Would CANCEL orders: {len(orders_all)}")
+            for i, o in enumerate(orders_all[:20], start=1):
+                sym = str(getattr(o, "symbol", "") or "")
+                side = str(getattr(o, "side", "") or "")
+                qty = float(getattr(o, "quantity", 0.0) or 0.0)
+                price = float(getattr(o, "price", 0.0) or 0.0)
+                status = str(getattr(o, "status", "") or "")
+                broker_tag = str(getattr(o, "broker", "") or "")
+                log(f"   #{i:02d} {broker_tag or '—'} {sym} {side} qty={qty:.6f} price={price:,.4f} status={status or '—'}")
+            if len(orders_all) > 20:
+                log(f"   ... and {len(orders_all) - 20} more")
+        else:
+            log("[DRILL] Would CANCEL orders: 0")
+
+        if positions:
+            log(f"[DRILL] Would CLOSE positions: {len(positions)}")
+            for i, p in enumerate(positions[:20], start=1):
+                broker_name = str(getattr(p, "broker", "") or "")
+                sym = str(getattr(p, "symbol", "") or "")
+                qty = float(getattr(p, "quantity", 0.0) or 0.0)
+                avg = float(getattr(p, "avg_price", 0.0) or 0.0)
+                last = float(getattr(p, "last_price", avg) or 0.0)
+                upnl = float(getattr(p, "unrealized_pnl", 0.0) or 0.0)
+                side = "LONG" if qty > 0 else "SHORT"
+                log(f"   #{i:02d} {broker_name or '—'} {sym} {side} qty={abs(qty):.6f} avg={avg:,.4f} last={last:,.4f} uPnL={upnl:,.2f}")
+            if len(positions) > 20:
+                log(f"   ... and {len(positions) - 20} more")
+        else:
+            log("[DRILL] Would CLOSE positions: 0")
+
+        # 5) verdict + LEDs
+        log(f"[DRILL] Latency: {latency_ms} ms")
+        if latency_ms > 2000:
+            log("[DRILL] ⚠️ Verdict: SLOW (yellow) — connection/latency worth watching before LIVE.")
+            try:
+                self._set_live_quality_leds("yellow")
+            except Exception:
+                pass
+        else:
+            log("[DRILL] ✅ Verdict: OK (green) — router responds, snapshot methods reachable.")
+            try:
+                self._set_live_quality_leds("green")
+            except Exception:
+                pass
+
+        log("[DRILL] Done.")
+        log("—" * 60)
+
+    def on_live_reconnect_router(self):
+        """
+        Reconnect / Re-init Router:
+        - сбрасывает флаг инициализации
+        - пытается очистить брокеров (если есть)
+        """
+        router = getattr(self, "execution_router", None)
+        self._router_initialized = False
+
+        if router is not None and hasattr(router, "_brokers"):
+            try:
+                router._brokers = {}
+            except Exception:
+                pass
+
+        if hasattr(self, "live_log"):
+            self.live_log.append("[ROUTER] Reconnect requested: will re-initialize on next refresh.")
+
+        self.refresh_live_monitor_snapshot()
+
+
+    def _get_protections_path(self) -> str | None:
+        candidates = [
+            os.path.join("state", "protections.json"),
+            "protections.json",
+        ]
+        for p in candidates:
+            if os.path.exists(p):
+                return p
+        return None
+
+
+    def open_protections_file(self):
+        p = self._get_protections_path()
+        if not p:
+            if hasattr(self, "live_log"):
+                self.live_log.append("[PROT] protections.json not found.")
+            return
+        try:
+            os.startfile(p)  # Windows
+        except Exception as e:
+            if hasattr(self, "live_log"):
+                self.live_log.append(f"[PROT] Open file failed: {e}")
+
+
+    def validate_protections_file(self):
+        p = self._get_protections_path()
+        if not p:
+            if hasattr(self, "live_log"):
+                self.live_log.append("[PROT] protections.json not found.")
+            return
+
+        try:
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            if hasattr(self, "live_log"):
+                self.live_log.append(f"[PROT] JSON parse error: {e}")
+            return
+
+        issues = []
+        count = 0
+
+        if isinstance(data, dict):
+            for k, v in data.items():
+                count += 1
+                if not isinstance(v, dict):
+                    issues.append(f"{k}: not a dict")
+                    continue
+                mode = v.get("mode")
+                if not mode:
+                    issues.append(f"{k}: missing mode")
+                if not (v.get("trade_id") or v.get("symbol")):
+                    issues.append(f"{k}: missing trade_id/symbol")
+        else:
+            issues.append("Top-level must be dict")
+
+        if hasattr(self, "live_log"):
+            self.live_log.append(f"[PROT] protections entries: {count}")
+            if issues:
+                self.live_log.append("[PROT] issues:")
+                for it in issues[:30]:
+                    self.live_log.append(f"  - {it}")
+            else:
+                self.live_log.append("[PROT] OK")
+
+        # Refresh panel after validate
+        self._refresh_protections_panel_best_effort()
+
+
+    def _refresh_protections_panel_best_effort(self):
+        """
+        Обновляет PROTECTIONS INSPECTOR в UI (без падений).
+        """
+        p = self._get_protections_path()
+        if not hasattr(self, "lbl_prot_status") or not hasattr(self, "tbl_protections"):
+            return
+
+        if not p:
+            self.lbl_prot_status.setText("protections: not found (expected state/protections.json)")
+            self.tbl_protections.setRowCount(0)
+            return
+
+        try:
+            mtime = datetime.fromtimestamp(os.path.getmtime(p)).strftime("%Y-%m-%d %H:%M:%S")
+            with open(p, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception as e:
+            self.lbl_prot_status.setText(f"protections: ERROR reading ({e})")
+            self.tbl_protections.setRowCount(0)
+            return
+
+        if not isinstance(data, dict):
+            self.lbl_prot_status.setText(f"protections: invalid format (not dict) | {p}")
+            self.tbl_protections.setRowCount(0)
+            return
+
+        self.lbl_prot_status.setText(f"protections: {len(data)} entries | updated: {mtime} | path: {p}")
+
+        # table
+        rows = []
+        for k, v in data.items():
+            if isinstance(v, dict):
+                rows.append((
+                    str(k),
+                    str(v.get("mode", "—")),
+                    str(v.get("sl", "—")),
+                    str(v.get("tp", "—")),
+                    str(v.get("updated_at", v.get("last_update", "—"))),
+                ))
+            else:
+                rows.append((str(k), "—", "—", "—", "invalid"))
+
+        self.tbl_protections.setRowCount(len(rows))
+        for r, row in enumerate(rows[:200]):
+            for c, val in enumerate(row):
+                self.tbl_protections.setItem(r, c, QTableWidgetItem(val))
+
+
+    def _refresh_signal_health_panel_best_effort(self, positions, mode, total_equity: float):
+        """
+        Мини-панель: Signals + ATR + Block reasons.
+        Сейчас ATR best-effort (если в signals есть колонка atr/atr_14 — покажем).
+        """
+        import pickle
+
+        if not hasattr(self, "tbl_signal_health"):
+            return
+
+        # throttle
+        now_ts = time.time()
+        last = getattr(self, "_last_signal_panel_update_ts", 0.0)
+        if now_ts - last < 5.0:
+            return
+        self._last_signal_panel_update_ts = now_ts
+
+        # symbols: positions first else first 6 from selected assets
+        symbols = []
+        for p in positions or []:
+            s = getattr(p, "symbol", None)
+            if s:
+                symbols.append(str(s))
+        symbols = list(dict.fromkeys(symbols))
+        if not symbols:
+            try:
+                symbols = (self.get_selected_assets() or [])[:6]
+            except Exception:
+                symbols = []
+
+        # load signals dict
+        sig_path = os.path.join("data_cache", "production_signals_v1.pkl")
+        signals = {}
+        if os.path.exists(sig_path):
+            try:
+                with open(sig_path, "rb") as f:
+                    signals = pickle.load(f) or {}
+            except Exception:
+                signals = {}
+
+        # global block reason
+        block = "OK"
+        if mode.value == "live" and not bool(getattr(Config, "ALLOW_LIVE", False)):
+            block = "DISARMED"
+        # можно расширить сюда kill-switch/dd-guard
+
+        rows = []
+        for sym in symbols[:12]:
+            p_long = p_short = regime = atr = "—"
+            df = signals.get(sym)
+            try:
+                if df is not None and hasattr(df, "iloc") and len(df) > 0:
+                    last_row = df.iloc[-1]
+                    if "p_long" in last_row:
+                        p_long = f"{float(last_row['p_long']):.3f}"
+                    if "p_short" in last_row:
+                        p_short = f"{float(last_row['p_short']):.3f}"
+                    if "regime" in last_row:
+                        regime = str(last_row["regime"])
+                    # ATR best-effort
+                    for col in ("atr", "atr_14", "ATR", "ATR14"):
+                        if col in last_row:
+                            atr = f"{float(last_row[col]):.6f}"
+                            break
+            except Exception:
+                pass
+
+            rows.append((sym, p_long, p_short, regime, atr, block))
+
+        self.tbl_signal_health.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            for c, val in enumerate(row):
+                self.tbl_signal_health.setItem(r, c, QTableWidgetItem(str(val)))
 
     def get_selected_assets(self) -> list[str]:
         """
@@ -1900,6 +2806,11 @@ class FundManagerWindow(QMainWindow):
             if self.live_timer.isActive():
                 self.live_timer.stop()
 
+        # --- NEW: hard-arm guard (block START when LIVE disarmed) ---
+        self._apply_live_arm_guard()
+        # --- NEW: update LIVE banner/LEDs even without refresh ---
+        self._update_live_arm_banner_only()
+
     def on_execution_mode_changed(self):
         """
         Хэндлер radio-кнопок: обновляет Config.EXECUTION_MODE, ENV и таймер.
@@ -1955,6 +2866,14 @@ class FundManagerWindow(QMainWindow):
 
         if mode == "backtest":
             msg = "[TRADING] EXECUTION_MODE=backtest — live-сессию не запускаем. Переключись на PAPER или LIVE."
+            print(msg)
+            if hasattr(self, "live_log"):
+                self.live_log.append(msg)
+            return
+
+        # --- NEW: hard-arm guard ---
+        if mode == "live" and not bool(getattr(Config, "ALLOW_LIVE", False)):
+            msg = "[TRADING] LIVE is DISARMED (ALLOW_LIVE=false) — START blocked."
             print(msg)
             if hasattr(self, "live_log"):
                 self.live_log.append(msg)
@@ -2212,7 +3131,7 @@ class FundManagerWindow(QMainWindow):
 if __name__ == "__main__":
     os.environ["QT_AUTO_SCREEN_SCALE_FACTOR"] = "1"
     app = QApplication(sys.argv)
-    app.setStyle("Fusion")
+    app.setStyle(BlackIndicatorStyle("Fusion"))
     font = QFont("Segoe UI", 10)
     app.setFont(font)
     window = FundManagerWindow()
