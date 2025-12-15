@@ -78,7 +78,6 @@ class BitgetBroker(BrokerAPI):
 
         # [NEW] Хранилище правил торговли: symbol -> precision (int)
         self._symbol_rules: Dict[str, int] = {}
-        self._symbol_rules: Dict[str, int] = {}      # qty precision
         self._price_rules: Dict[str, int] = {}       # price precision
     # ------------------------------------------------------------------
     # Lifecycle
@@ -523,7 +522,7 @@ class BitgetBroker(BrokerAPI):
             coin = asset.get("coin")
             if not coin:
                 continue
-                
+
             available = float(asset.get("available", 0))
             frozen = float(asset.get("frozen", 0))
             total = available + frozen
@@ -533,12 +532,31 @@ class BitgetBroker(BrokerAPI):
                 "total": total,
             }
 
+            # FIX: USDT берём здесь, внутри цикла
             if coin == "USDT":
                 usdt_total = total
 
+        # NEW: считаем equity как USDT + оценка монет в USDT
+        equity_total = float(usdt_total)
+
+        for coin, st in details.items():
+            if coin == "USDT":
+                continue
+            qty = float((st or {}).get("total", 0.0) or 0.0)
+            if qty <= 0:
+                continue
+
+            sym = f"{coin}USDT"
+            try:
+                px = float(await self.get_current_price(sym))
+            except Exception:
+                continue
+
+            equity_total += qty * px
+
         return AccountState(
-            equity=usdt_total,
-            balance=usdt_total,
+            equity=equity_total,
+            balance=usdt_total,   # cash
             currency="USDT",
             margin_used=0.0,
             broker=self.name,
