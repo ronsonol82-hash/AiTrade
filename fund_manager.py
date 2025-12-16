@@ -15,7 +15,7 @@ from PyQt5.QtWidgets import (
     QWidget, QLabel, QComboBox, QGroupBox, QTabWidget, QPushButton,
     QTextEdit, QSplitter, QDoubleSpinBox, QGridLayout, QFrame, QSlider,
     QTableWidget, QHeaderView, QTableWidgetItem, QRadioButton, QCheckBox,
-    QTableView,
+    QTableView, QAction, QMenuBar,
     QScrollArea, QProxyStyle, QStyle,   # <-- NEW
 )
 from PyQt5.QtCore import QThread, pyqtSignal, Qt, QObject, QTimer
@@ -31,6 +31,7 @@ from config import Config, UniverseMode, get_assets_for_universe
 from data_loader import DataLoader
 from indicators import FeatureEngineer
 from execution_router import ExecutionRouter
+from gui_settings import SettingsDialog
 
 # ==========================================
 # 🎨 GLOBAL STYLESHEET (PROFESSIONAL DARK FIXED)
@@ -104,6 +105,45 @@ QLineEdit:disabled, QComboBox:disabled, QSpinBox:disabled, QDoubleSpinBox:disabl
     background-color: #1e1e1e;
     color: #555555;
     border: 1px solid #333333;
+}
+
+/* --- MENU BAR --- */
+QMenuBar {
+    background-color: #2d2d2d;   /* Цвет фона самой полосы */
+    color: #e0e0e0;              /* Цвет текста */
+    border-bottom: 1px solid #3e3e3e; /* Разделительная линия снизу */
+}
+QMenuBar::item {
+    background: transparent;
+    padding: 6px 10px;
+}
+QMenuBar::item:selected {        /* При наведении мыши */
+    background-color: #3e3e3e;
+    color: #ffffff;
+}
+QMenuBar::item:pressed {
+    background-color: #555555;
+}
+
+/* --- MENUS (Выпадающие списки) --- */
+QMenu {
+    background-color: #252526;   /* Фон выпадающего меню */
+    border: 1px solid #454545;   /* Рамка вокруг */
+    color: #e0e0e0;
+    padding: 4px;
+}
+QMenu::item {
+    padding: 5px 25px 5px 20px;  /* Отступы для пунктов */
+    border-radius: 3px;
+}
+QMenu::item:selected {           /* Активный пункт (под мышкой) */
+    background-color: #0e639c;   /* Синий цвет выделения (как у кнопок) */
+    color: #ffffff;
+}
+QMenu::separator {
+    height: 1px;
+    background: #454545;
+    margin: 5px 0;
 }
 
 /* --- TABLES --- */
@@ -419,7 +459,7 @@ class WFOSettingsWidget(QGroupBox):
         self.setLayout(layout)
         # Сразу приводим подписи в соответствие с текущими значениями
         self.update_labels()
-        
+
     def update_labels(self):
         train_val = self.slider_train.value()
         test_val = self.slider_test.value()
@@ -499,6 +539,22 @@ class FundManagerWindow(QMainWindow):
         # 1) Строим UI (создаётся self.console)
         self.setup_ui()
 
+        # Создаем Menu Bar
+        menubar = self.menuBar()  # Получаем встроенный бар окна
+        # Меню "Настройки"
+        settings_menu = menubar.addMenu('⚙ Настройки')
+        
+        # Пункт: Параметры бота (.env)
+        edit_config_action = QAction('Параметры бота (.env)', self)
+        edit_config_action.triggered.connect(self.open_settings_window)
+        settings_menu.addAction(edit_config_action)
+        
+        # Разделитель и Выход
+        settings_menu.addSeparator()
+        exit_action = QAction('Выход', self)
+        exit_action.triggered.connect(self.close)
+        settings_menu.addAction(exit_action)
+        # ==========================================
         # 2) Настраиваем перехват stdout/stderr в SYSTEM TERMINAL
         self.signaller = Signaller()
         self.signaller.text_written.connect(self.log_message)
@@ -581,6 +637,19 @@ class FundManagerWindow(QMainWindow):
         main_splitter.setStretchFactor(1, 1)
 
         outer_layout.addWidget(main_splitter)
+
+    def open_settings_window(self):
+        """Открывает модальное окно настроек из .env"""
+        try:
+            dialog = SettingsDialog(self)
+            dialog.exec_() # Блокирует основное окно, пока открыты настройки
+            
+            # (Опционально) Если настройки поменяли что-то критичное, можно обновить UI
+            # self.load_optimizer_settings() 
+        except Exception as e:
+            if hasattr(self, "live_log"):
+                self.live_log.append(f"[ERROR] Не удалось открыть настройки: {e}")
+            print(f"[ERROR] SettingsDialog crash: {e}")
 
     def log_message(self, text):
         # Если по какой-то причине console ещё не создан – тихо выходим
