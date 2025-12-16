@@ -477,20 +477,15 @@ class Config:
 
     # --- Telegram channels per universe ---
     TG_CRYPTO_CHANNELS = [
-        'tree_of_alpha',
-        'unusual_whales',
-        'WatcherGuru',
-        'Tier10k',
-        'WalterBloomberg',
-        'Cointelegraph',
-        'CryptoTownEU',
+        'WatcherGuru',      # ✅ Живой
+        'WalterBloomberg',  # ✅ Живой
+        'Cointelegraph',    # ✅ Живой
     ]
 
     TG_STOCK_CHANNELS = [
-        'smartlab_ru',
-        'moex_official',
-        'finam_ru',
-        'rbc_invest',
+        'smartlabnews',     # ✅ Замена smartlab_ru (официальный)
+        'markettwits',      # ✅ Замена rbc_invest (актуальный)
+        'finamalert',       # ✅ Замена finam_ru (официальный)
     ]
 
     # --- Flags: enable / disable Telegram HTF per asset class ---
