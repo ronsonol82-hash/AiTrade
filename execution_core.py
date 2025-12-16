@@ -102,28 +102,14 @@ def simulate_core_logic(
             # поэтому нужно передать whale_footprint как параметр функции
             # ИЛИ считать его здесь на лету (второй вариант ниже)
             
-            # ВАРИАНТ A: Если whale_footprint уже есть в массиве (добавь параметр в функцию)
+            # Если whale_footprint уже есть в массиве (добавь параметр в функцию)
             whale_signal = whale_footprints[i]  # 0 или 1
             iceberg_val = iceberg_pressures[i]   # float
-            
-            # ВАРИАНТ B: Быстрый расчет "на лету" (без изменения сигнатуры функции)
-            # Считаем относительный спред свечи
-            bar_spread = hi - lo
-            spread_rel = bar_spread / atr if atr > 0.000001 else 0.0
             
             # Берем объем из... стоп, у нас нет volume в ядре!
             # Значит, используем косвенный индикатор: если бар ОЧЕНЬ маленький (< 0.3 ATR)
             # при этом цена НЕ двигается (abs(cl - op) < 0.2 ATR), но мы ВНУТРИ позиции —
             # это может быть признак накопления/распределения
-            
-            body_size = abs(cl - op)
-            is_small_spread = (spread_rel < 0.3)
-            is_small_body = (body_size < (atr * 0.2))
-            
-            # Если свеча мелкая (доджи-подобная) на фоне волатильности — это "след кита"
-            if is_small_spread and is_small_body:
-                whale_signal = 1
-                iceberg_val = 1.0 / (spread_rel + 0.01) # Чем меньше спред, тем больше давление
             
             # --- [2. MOON MODE DETECTOR & ADAPTIVE TARGETS] ---
             # Считаем дистанцию от входа в ATR
