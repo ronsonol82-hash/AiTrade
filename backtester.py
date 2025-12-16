@@ -134,6 +134,18 @@ class PortfolioBacktester:
             timestamps = df.index.to_numpy(dtype="int64") // 10**9
             day_ids = (timestamps // 86400).astype(np.int64)
 
+            # [FIX START] Извлекаем китовые метрики
+            if "whale_footprint" in df.columns:
+                whale_footprints = df["whale_footprint"].fillna(0).values.astype(np.int64)
+            else:
+                whale_footprints = np.zeros(len(closes), dtype=np.int64)
+
+            if "iceberg_pressure" in df.columns:
+                iceberg_pressures = df["iceberg_pressure"].fillna(0).values.astype(np.float64)
+            else:
+                iceberg_pressures = np.zeros(len(closes), dtype=np.float64)
+            # [FIX END]
+
             p_longs = df["p_long"].values.astype(np.float64)
             p_shorts = df["p_short"].values.astype(np.float64)
             regimes = df["regime"].values.astype(np.int64)
@@ -150,6 +162,8 @@ class PortfolioBacktester:
                 Config.COMMISSION,
                 deposit_per_symbol,
                 Config.RISK_PER_TRADE,
+                whale_footprints,    # <--- НОВЫЙ АРГУМЕНТ 1
+                iceberg_pressures    # <--- НОВЫЙ АРГУМЕНТ 2
             )
 
             eq = np.asarray(eq, dtype=np.float64)

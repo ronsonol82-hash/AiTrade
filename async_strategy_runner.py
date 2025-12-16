@@ -400,7 +400,7 @@ class AsyncStrategyRunner:
         risk = base_risk + (max_risk - base_risk) * scale
         return max(base_risk, min(max_risk, risk))
     
-    async def _update_dynamic_trailing(self, symbol: str, current_price: float, prot: dict) -> bool:
+    async def _update_dynamic_trailing(self, symbol: str, current_price: float, prot: dict, is_whale_active: bool = False) -> bool:
         """
         [LIVE-READY] Moon Mode Lite: динамический трейлинг защит.
 
@@ -519,10 +519,19 @@ class AsyncStrategyRunner:
             
             # Достаем TP из protections
             tp_price_val = _f(prot.get("tp"), 0.0)
+            # [FIX START] Логика ширины трейлинга
+            # Дефолтный отступ
             base_offset = atr * trail_offset_atr
             
-            # Если TP есть, считаем Squeeze (сжатие пружины)
-            if tp_price_val > 0:
+            # Если обнаружен КИТ (Whale), даем цене дышать (как в execution_core: 4.5 ATR вместо узкого стопа)
+            if is_whale_active:
+                # В execution_core было: current_trail_mult = 4.5
+                # Здесь мы динамически расширяем оффсет
+                base_offset = atr * 4.5 
+                print(f"🐋 WHALE DETECTED on {symbol}: Widening trail to 4.5 ATR")
+            
+            # Если TP есть, считаем Squeeze (сжатие пружины), но не зажимаем кита
+            if tp_price_val > 0 and not is_whale_active:
                 if qty > 0: # LONG
                     dist_remain = tp_price_val - max_price
                     total_run = tp_price_val - entry_price
@@ -774,6 +783,19 @@ class AsyncStrategyRunner:
                 current_price = float(await broker.get_current_price(symbol))
             except Exception:
                 continue
+
+            # [FIX START] Пытаемся понять, есть ли след кита на последней свече
+            is_whale = False
+            # Ищем символ в загруженных сигналах (self.signals)
+            if symbol in self.signals and not self.signals[symbol].empty:
+                try:
+                    # Берем последнюю строку
+                    last_row = self.signals[symbol].iloc[-1]
+                    # Проверяем флаг (если он есть в features_lib)
+                    if last_row.get('whale_footprint', 0) > 0:
+                        is_whale = True
+                except Exception:
+                    pass
 
             # [FIX] Вызов динамического трейлинга
             if await self._update_dynamic_trailing(symbol, current_price, prot):

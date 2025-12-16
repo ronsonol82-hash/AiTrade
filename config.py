@@ -335,13 +335,17 @@ class Config:
         'sup_strength', 'res_strength',
         'fib_382', 'fib_618',
         'rvol', 'rsi', 'adx', 'volatility',
-        'regime', 'funding_rate', 'leader_close',
+        'regime', 'funding_rate', 'leader_close', 
+        'whale_footprint', 'iceberg_pressure'
     ]
 
     # Набор фич для универсальной модели (БЕЗ абсолютных цен)
     UNIVERSAL_FEATURE_COLS = [
         # интегральный скор
         'confluence_score',
+
+        # КИТЫ
+        'whale_footprint', 'iceberg_pressure'
 
         # локальная структура и уровни
         'sup_dist_atr', 'res_dist_atr',
