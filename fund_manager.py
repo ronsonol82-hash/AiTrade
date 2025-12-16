@@ -783,6 +783,27 @@ class FundManagerWindow(QMainWindow):
         btn_feat  = QPushButton("Feature Lab");     btn_feat.setObjectName("DiagBtn")
         btn_plot  = QPushButton("Plot");            btn_plot.setObjectName("DiagBtn")
         btn_validation = QPushButton("Valid Rep");  btn_validation.setObjectName("DiagBtn")
+        # 🔹 Новые кнопки для Debug Replay
+        btn_debug = QPushButton("Debug Replay (no plots)")
+        btn_debug.setObjectName("DiagBtn")
+        btn_debug_plots = QPushButton("Debug Replay + Charts")
+        btn_debug_plots.setObjectName("DiagBtn")
+
+        # 🔹 Новые кнопки: инструменты и тест коннекта
+        btn_get_instruments = QPushButton("Get Instruments")
+        btn_get_instruments.setObjectName("DiagBtn")
+        btn_test_conn = QPushButton("Test Connections")
+        btn_test_conn.setObjectName("DiagBtn")
+        
+        # 🔹 High-level тесты
+        btn_full_cycle = QPushButton("Full Cycle Test");    btn_full_cycle.setObjectName("DiagBtn")
+        btn_async_bg   = QPushButton("Async Bitget");       btn_async_bg.setObjectName("DiagBtn")
+        btn_no_look    = QPushButton("Core No-Lookahead"); btn_no_look.setObjectName("DiagBtn")
+
+        # 🔥 НОВЫЕ КНОПКИ (которые мы добавляем)
+        btn_channels = QPushButton("Check Channels");      btn_channels.setObjectName("DiagBtn")
+        btn_viz      = QPushButton("Visualizer");          btn_viz.setObjectName("DiagBtn")
+        btn_sig_scr  = QPushButton("Signal Script");       btn_sig_scr.setObjectName("DiagBtn")
         btn_full_cycle = QPushButton("Full Cycle Test");    btn_full_cycle.setObjectName("DiagBtn")
         btn_async_bg   = QPushButton("Async Bitget");       btn_async_bg.setObjectName("DiagBtn")
         btn_no_look    = QPushButton("Core No-Lookahead"); btn_no_look.setObjectName("DiagBtn")
@@ -837,30 +858,40 @@ class FundManagerWindow(QMainWindow):
         btn_no_look.clicked.connect(
             lambda: self.run_script("test_core_no_lookahead.py", [])
         )
-        # Расставляем сеткой 4x4
+        # 🔥 Привязка НОВЫХ кнопок
+        btn_channels.clicked.connect( lambda: self.run_script("check_channels.py", []))
+        btn_viz.clicked.connect(      lambda: self.run_script("visualizer.py", []))
+        btn_sig_scr.clicked.connect(  lambda: self.run_script("signal_script.py", []))
+        # --- Расставляем сеткой 5x4 (теперь 5 рядов) ---
+        # Ряд 0
         diag_layout.addWidget(btn_gpu,   0, 0)
         diag_layout.addWidget(btn_leak,  0, 1)
         diag_layout.addWidget(btn_noise, 0, 2)
         diag_layout.addWidget(btn_stats, 0, 3)
 
+        # Ряд 1
         diag_layout.addWidget(btn_bal,   1, 0)
         diag_layout.addWidget(btn_probs, 1, 1)
         diag_layout.addWidget(btn_core,  1, 2)
         diag_layout.addWidget(btn_feat,  1, 3)
 
-        # Третий ряд – Debug Replay
+        # Ряд 2 (Debug Replay)
         diag_layout.addWidget(btn_debug,       2, 0)
         diag_layout.addWidget(btn_debug_plots, 2, 1)
         diag_layout.addWidget(btn_plot,        2, 2)
         diag_layout.addWidget(btn_validation,  2, 3)
 
-        # Четвёртый ряд – инфраструктурные проверки
+        # Ряд 3 (Connection & Infra)
         diag_layout.addWidget(btn_get_instruments, 3, 0)
         diag_layout.addWidget(btn_test_conn,       3, 1)
-        # 4-й ряд – high-level тесты
-        diag_layout.addWidget(btn_full_cycle, 3, 2)
-        diag_layout.addWidget(btn_async_bg,   3, 3)
+        diag_layout.addWidget(btn_full_cycle,      3, 2)
+        diag_layout.addWidget(btn_async_bg,        3, 3)
+        
+        # Ряд 4 (Core tests + NEW BUTTONS)
         diag_layout.addWidget(btn_no_look,    4, 0)
+        diag_layout.addWidget(btn_channels,   4, 1) # 🔥 Check Channels
+        diag_layout.addWidget(btn_viz,        4, 2) # 🔥 Visualizer
+        diag_layout.addWidget(btn_sig_scr,    4, 3) # 🔥 Signal Script
 
         # 2. EXECUTION MODE & TRADING CONTROL
         mode_group = QGroupBox("EXECUTION MODE & TRADING CONTROL")
