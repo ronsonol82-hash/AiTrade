@@ -126,32 +126,60 @@ def clean_text(text):
 
 def get_bert_sentiment_batch(texts, batch_size=16):
     """
-    Обрабатывает список текстов пачкой.
-    batch_size=16 или 32 - зависит от твоей VRAM. 
-    Если вылетит CUDA OOM, уменьшай до 8.
+    Обрабатывает список текстов пачкой с перехватом сигналов о крупных сделках.
     """
-    clean_texts = [t[:512] for t in texts] # Обрезаем по длине токенов BERT
+    # 1. Списки триггеров (Aladdin footprints)
+    # Если эти слова есть в сообщении, мы игнорируем BERT и ставим макс. балл
+    WHALE_BUY = [
+        "block trade bought", "dark pool buy", "whale accumulated", 
+        "huge buy order", "millions bought", "institutional buy", 
+        "blackrock buy", "otc deal buy"
+    ]
+    
+    WHALE_SELL = [
+        "block trade sold", "dark pool sell", "whale dumped", 
+        "huge sell order", "millions sold", "institutional sell", 
+        "dumping", "liquidation cascade"
+    ]
+
+    # Обрезаем тексты для BERT, но оригинальные texts нам тоже нужны для проверки ключевиков
+    clean_texts = [t[:512] for t in texts] 
     results = []
     
-    # Защита от пустого списка
     if not clean_texts:
         return []
 
     try:
-        # Pipeline сам умеет в батчи, если передать список
+        # Pipeline обрабатывает батч
         predictions = sentiment_pipeline(clean_texts, truncation=True, batch_size=batch_size)
         
-        for p in predictions:
+        # --- SURGICAL UPDATE: Используем zip, чтобы сопоставить прогноз и текст ---
+        for p, original_text in zip(predictions, texts):
+            
+            # 1. Базовый расчет от BERT
             score = p['score']
             if p['label'] == 'negative':
                 score = -score
             elif p['label'] == 'neutral':
                 score = 0.0
+            
+            # 2. Анализ "Следов Кита" (Whale Override)
+            text_lower = original_text.lower()
+            
+            # Если это сигнал на покупку от кита — ставим максимум, плевать что думает BERT
+            if any(trig in text_lower for trig in WHALE_BUY):
+                # print(f"🐋 WHALE BUY DETECTED: {original_text[:40]}...") # Раскомментируй для отладки
+                score = 0.95
+                
+            # Если это сигнал на слив
+            elif any(trig in text_lower for trig in WHALE_SELL):
+                # print(f"🐋 WHALE SELL DETECTED: {original_text[:40]}...")
+                score = -0.95
+                
             results.append(score)
             
     except Exception as e:
         print(f"🔥 GPU Batch Error: {e}")
-        # Fallback: если батч упал, возвращаем нули
         return [0.0] * len(texts)
         
     return results

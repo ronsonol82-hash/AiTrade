@@ -10,7 +10,9 @@ def simulate_core_logic(
     trail_on, trail_act_mult, trail_off_mult, 
     max_hold_bars,
     pullback_mult, fill_wait_bars, abort_threshold,
-    mode_sniper, commission, deposit, risk_per_trade
+    mode_sniper, commission, deposit, risk_per_trade,
+    whale_footprints,
+    iceberg_pressures
 ):
     n = len(closes)
     equity = np.zeros(n)
@@ -89,32 +91,81 @@ def simulate_core_logic(
         if in_position:
             exit_signal = False; exit_price = 0.0; reason = 0 
             
-            # --- ЛОГИКА "РАКЕТЫ" (BREAKOUT TRIGGER) 🚀 ---
-            # Триггер: Цена закрылась за пределами канала?
-            # Или просто прошла далеко от входа (> 3 ATR)
-            dist_from_entry = 0.0
-            if pos_type == 1: dist_from_entry = hi - entry_price
-            else: dist_from_entry = entry_price - lo
+            # --- [1. WHALE FOOTPRINT DETECTOR 🐋] ---
+            # Новая фича из features_lib: whale_footprint и iceberg_pressure
+            # Считываем индикатор "следа кита" на текущем баре
+            whale_signal = 0
+            iceberg_val = 0.0
             
-            # Если мы уже в хорошем плюсе (> 2.5 ATR), активируем режим Ракеты.
-            # Это значит - мы не хотим тейк, мы хотим лететь.
-            if dist_from_entry > (atr * 2.5):
+            # Проверяем, есть ли в DataFrame нужные колонки (если фичи включены)
+            # Внимание: execution_core работает с numpy-массивами, 
+            # поэтому нужно передать whale_footprint как параметр функции
+            # ИЛИ считать его здесь на лету (второй вариант ниже)
+            
+            # ВАРИАНТ A: Если whale_footprint уже есть в массиве (добавь параметр в функцию)
+            whale_signal = whale_footprints[i]  # 0 или 1
+            iceberg_val = iceberg_pressures[i]   # float
+            
+            # ВАРИАНТ B: Быстрый расчет "на лету" (без изменения сигнатуры функции)
+            # Считаем относительный спред свечи
+            bar_spread = hi - lo
+            spread_rel = bar_spread / atr if atr > 0.000001 else 0.0
+            
+            # Берем объем из... стоп, у нас нет volume в ядре!
+            # Значит, используем косвенный индикатор: если бар ОЧЕНЬ маленький (< 0.3 ATR)
+            # при этом цена НЕ двигается (abs(cl - op) < 0.2 ATR), но мы ВНУТРИ позиции —
+            # это может быть признак накопления/распределения
+            
+            body_size = abs(cl - op)
+            is_small_spread = (spread_rel < 0.3)
+            is_small_body = (body_size < (atr * 0.2))
+            
+            # Если свеча мелкая (доджи-подобная) на фоне волатильности — это "след кита"
+            if is_small_spread and is_small_body:
+                whale_signal = 1
+                iceberg_val = 1.0 / (spread_rel + 0.01) # Чем меньше спред, тем больше давление
+            
+            # --- [2. MOON MODE DETECTOR & ADAPTIVE TARGETS] ---
+            # Считаем дистанцию от входа в ATR
+            dist_from_entry_val = 0.0
+            if pos_type == 1: 
+                dist_from_entry_val = cl - entry_price
+            else: 
+                dist_from_entry_val = entry_price - cl
+            
+            atr_dist = 0.0
+            if atr > 0.000001: 
+                atr_dist = dist_from_entry_val / atr
+            
+            # Активация режима "РАКЕТА" 🚀
+            # Триггеры:
+            # 1. Цена улетела > 4 ATR от входа (классический брейкаут)
+            # 2. ИЛИ обнаружен "след кита" при прибыли > 2 ATR (накопление перед импульсом)
+            rocket_distance_trigger = (atr_dist > 4.0)
+            whale_boost_trigger = (whale_signal > 0 and atr_dist > 2.0)
+            
+            if rocket_distance_trigger or whale_boost_trigger:
                 is_moon_active = True
             
+            # Если Луна активна — отодвигаем TP в космос
             current_tp_target = tp_price
             if is_moon_active:
-                if pos_type == 1: current_tp_target = entry_price + (atr * 100)
-                else: current_tp_target = entry_price - (atr * 100)
-
-            # 1. Check Hard SL/TP
+                if pos_type == 1: 
+                    current_tp_target = entry_price + (atr * 100.0)
+                else: 
+                    current_tp_target = entry_price - (atr * 100.0)
+            
+            # --- [3. CHECK HARD SL/TP] ---
             if pos_type == 1:
+                # Long: проверяем пробой стопа вниз или тейка вверх
                 if lo <= sl_price: 
                     exit_signal = True; exit_price = sl_price; reason = 0
-                    if op < sl_price: exit_price = op 
+                    if op < sl_price: exit_price = op  # Gap protection
                 elif hi >= current_tp_target:
                     exit_signal = True; exit_price = current_tp_target; reason = 1
                     if op > current_tp_target: exit_price = op
             else:
+                # Short: зеркально
                 if hi >= sl_price:
                     exit_signal = True; exit_price = sl_price; reason = 0
                     if op > sl_price: exit_price = op
@@ -122,52 +173,43 @@ def simulate_core_logic(
                     exit_signal = True; exit_price = current_tp_target; reason = 1
                     if op < current_tp_target: exit_price = op
             
-            # 2. Dynamic Trailing
+            # --- [4. DYNAMIC TRAILING STOP (3-РЕЖИМНЫЙ)] ---
             if not exit_signal and trail_on > 0.5:
-                trail_activation_dist = atr * trail_act_mult
-                base_trail_offset = atr * trail_off_mult
                 
+                # Выбираем ширину трейлинга в зависимости от фазы сделки:
+                # 
+                # PHASE 1: START (0-1.5 ATR) — Узкий стоп для защиты капитала
+                # PHASE 2: TREND (1.5-4 ATR) — Средний стоп, даем тренду дышать
+                # PHASE 3: ROCKET (>4 ATR) — Широкий стоп, ловим "хвост ракеты"
+                
+                current_trail_mult = trail_off_mult  # Дефолт из конфига (обычно 1.2-1.5)
+                
+                if is_moon_active:
+                    # РЕЖИМ РАКЕТЫ 🚀: Максимальная свобода (3.5 ATR от Close)
+                    current_trail_mult = 3.5
+                    
+                    # БОНУС: Если обнаружен "след кита" — ещё шире (кит копит на новый импульс)
+                    if whale_signal > 0:
+                        current_trail_mult = 4.5  # Даем киту докупиться
+                        
+                elif atr_dist > 1.5:
+                    # ХОРОШИЙ ТРЕНД: Чуть шире стандарта (1.8 ATR)
+                    current_trail_mult = 1.8
+                else:
+                    # НАЧАЛО СДЕЛКИ: Короткий стоп (1.0 ATR) для минимизации риска
+                    current_trail_mult = 1.0
+                
+                # Применяем трейлинг (только улучшаем цену стопа)
                 if pos_type == 1:
-                    dist_from_entry = hi - entry_price
-                    if dist_from_entry > trail_activation_dist:
-                        
-                        # Если РАКЕТА: Трал широкий (1.5x от базы), даем дышать
-                        if is_moon_active:
-                            moon_offset = base_trail_offset * 1.5 
-                            new_sl = hi - moon_offset
-                        else:
-                            # Если КАНАЛ: Сжатие (Squeeze)
-                            dist_remain = tp_price - hi
-                            total_run = tp_price - entry_price
-                            squeeze_factor = 0.0
-                            if total_run > 0: squeeze_factor = dist_remain / total_run
-                            if squeeze_factor < 0: squeeze_factor = 0
-                            if squeeze_factor > 1: squeeze_factor = 1
-                            dynamic_offset = base_trail_offset * squeeze_factor
-                            if dynamic_offset < (base_trail_offset * 0.1): dynamic_offset = base_trail_offset * 0.1
-                            new_sl = hi - dynamic_offset
-
-                        if new_sl > sl_price: sl_price = new_sl
-
+                    new_sl = cl - (atr * current_trail_mult)
+                    if new_sl > sl_price: 
+                        sl_price = new_sl
                 elif pos_type == -1:
-                    dist_from_entry = entry_price - lo
-                    if dist_from_entry > trail_activation_dist:
-                        
-                        if is_moon_active:
-                            moon_offset = base_trail_offset * 1.5
-                            new_sl = lo + moon_offset
-                        else:
-                            dist_remain = lo - tp_price
-                            total_run = entry_price - tp_price
-                            squeeze_factor = 0.0
-                            if total_run > 0: squeeze_factor = dist_remain / total_run
-                            if squeeze_factor < 0: squeeze_factor = 0
-                            if squeeze_factor > 1: squeeze_factor = 1
-                            dynamic_offset = base_trail_offset * squeeze_factor
-                            if dynamic_offset < (base_trail_offset * 0.1): dynamic_offset = base_trail_offset * 0.1
-                            new_sl = lo + dynamic_offset
-
-                        if new_sl < sl_price: sl_price = new_sl
+                    new_sl = cl + (atr * current_trail_mult)
+                    if new_sl < sl_price: 
+                        sl_price = new_sl
+            
+            # --- [END OF WHALE + MOON LOGIC] ---
 
             # 3. Time Exit & 4. Smart Cut & 5. Volatility Panic Exit
             if not exit_signal and (i - entry_idx) > max_hold_bars:
@@ -206,7 +248,7 @@ def simulate_core_logic(
                     if is_moon_active and reason == 0: final_reason = 5 
                     out_trades[t_ptr, 6] = final_reason
                     t_ptr += 1
-                in_position = False; pos_type = 0; pending_type = 0; continue 
+                in_position = False; pos_type = 0; pending_type = 0; is_moon_active = False; continue 
 
         # --- ENTRY LOGIC ---
         if not in_position and pending_type == 0:

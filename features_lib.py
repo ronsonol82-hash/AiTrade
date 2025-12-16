@@ -262,6 +262,23 @@ class StructureFeatures:
 
         vol_ma = df['volume'].rolling(20).mean()
         df['rvol'] = df['volume'] / vol_ma.replace(0, 1).fillna(1.0)
+
+        # --- [SURGICAL INSERT START] ---
+        # 1. Считаем относительный размер свечи (spread) к волатильности (ATR)
+        # Если ATR нет, используем простую нормализацию, но лучше брать ATR
+        atr_safe = df.get('atr', df['high'] - df['low']).replace(0, 0.0001)
+        df['spread_rel'] = (df['high'] - df['low']) / atr_safe
+
+        # 2. VSA (Volume Spread Analysis) Индекс усилия
+        # Логика: Если объем (rvol) большой, а спред (spread_rel) маленький ->
+        # Это "Effort without Result" (Усилие без результата) = Скрытый набор (Iceberg)
+        # Добавляем 0.1 в знаменатель, чтобы избежать деления на ноль при доджи
+        df['iceberg_pressure'] = df['rvol'] / (df['spread_rel'] + 0.1)
+
+        # 3. Маркер "Следа Кита" (Whale Footprint)
+        # Если давление > 3.0 (объем в 3 раза больше движения) — это аномалия
+        df['whale_footprint'] = (df['iceberg_pressure'] > 3.0).astype(int)
+        # --- [SURGICAL INSERT END] ---
         df['adx'] = ((high - low) / close).rolling(14).mean() * 100
         df['adx'] = df['adx'].fillna(0)
         
