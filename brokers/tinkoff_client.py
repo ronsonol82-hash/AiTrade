@@ -2,313 +2,216 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone, timedelta
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
 import asyncio
 import json
 import time
+import math  # <--- Добавили для корректного округления
 
 import pandas as pd
-import requests
+import aiohttp
 
 from .base import BrokerAPI, OrderRequest, OrderResult, Position, AccountState
-# см. brokers/base.py для описания интерфейса BrokerAPI
-
 
 class TinkoffV2Broker(BrokerAPI):
     """
-    Клиент для Tinkoff Invest API v2 через REST-gateway.
-
-    Сейчас:
-      - get_historical_klines  -> async через asyncio.to_thread
-      - get_current_price      -> async через asyncio.to_thread
-      - остальное (торговля, аккаунт) — NotImplemented
+    Асинхронный клиент для Tinkoff Invest API v2 (aiohttp).
+    Версия: Production-Ready (с защитой от Race Condition и Float Dust).
     """
 
-    name = "tinkoff"  # важно: совпадает с uname="tinkoff" в brokers.__init__
+    name = "tinkoff"
 
     def __init__(self, config: Dict[str, Any]):
-        """
-        Ожидаем в config:
-          {
-            "token": "...",            # обязательный
-            "sandbox": bool            # опционально, на будущее
-          }
-        """
         token = config.get("token") or ""
         if not token:
-            # даём понятную ошибку, чтобы не было "тихих" зависаний
             raise RuntimeError(
                 "TinkoffV2Broker: не задан токен. "
-                "Укажи его в Config.BROKERS['tinkoff']['token'] "
-                "или в переменной окружения TINKOFF_API_TOKEN."
+                "Укажи его в Config.BROKERS['tinkoff']['token']."
             )
 
+        self.token = token
         self.sandbox = bool(config.get("sandbox", False))
 
-        # базовый REST-адрес V2
         default_base = "https://sandbox-invest-public-api.tbank.ru/rest" if self.sandbox else "https://invest-public-api.tbank.ru/rest"
         self.base_url: str = config.get("base_url", default_base)
 
-        # HTTP-сессия с заголовками авторизации
-        self.session = requests.Session()
-        self.session.headers.update(
-            {
-                "Authorization": f"Bearer {token}",
-                "Accept": "application/json",
-                "Content-Type": "application/json",
-            }
-        )
-
-        # --- глобальный rate-limit для исторических свечей ---
-        self._history_min_interval = 60.0 / 25.0  # ~2.4с
+        self.session: Optional[aiohttp.ClientSession] = None
+        
+        # --- Rate Limits ---
+        self._history_min_interval = 60.0 / 25.0  # ~2.4с между запросами свечей
         self._last_history_call_ts: float = 0.0
+        self._rate_limit_lock = asyncio.Lock()  # <--- ЗАЩИТА ОТ ГОНКИ ПОТОКОВ
 
+        # --- Caches ---
         self._lot_sizes: Dict[str, int] = {}
+        self._figi_cache: Dict[str, str] = {} 
 
     # =====================================================================
     # Lifecycle
     # =====================================================================
 
     async def initialize(self) -> None:
-        # здесь ничего особенного, но для единообразия интерфейса пусть будет
-        return None
+        if self.session is None or self.session.closed:
+            headers = {
+                "Authorization": f"Bearer {self.token}",
+                "Accept": "application/json",
+                "Content-Type": "application/json",
+            }
+            # Timeouts: connect 5s (быстро падаем если нет сети), total 30s (на большие пейлоады)
+            timeout = aiohttp.ClientTimeout(total=30, connect=5)
+            self.session = aiohttp.ClientSession(headers=headers, timeout=timeout)
 
     async def close(self) -> None:
-        try:
-            self.session.close()
-        except Exception:
-            pass
+        if self.session and not self.session.closed:
+            await self.session.close()
 
     # =====================================================================
-    # ВСПОМОГАТЕЛЬНЫЕ МЕТОДЫ (sync)
+    # Helpers
     # =====================================================================
 
     @staticmethod
     def _to_rfc3339(dt: datetime) -> str:
-        """
-        Инвест-API ожидает time в RFC3339, с таймзоной.
-        Если tz не указана — считаем UTC.
-        """
         if dt.tzinfo is None:
             dt = dt.replace(tzinfo=timezone.utc)
         return dt.isoformat()
 
     @staticmethod
     def _interval_to_v2_enum(interval: str) -> str:
-        """
-        Маппинг внутренних интервалов на CandleInterval v2.
-        """
         norm = interval.lower()
-
-        if norm in ("1m", "1min"):
-            return "CANDLE_INTERVAL_1_MIN"
-        if norm in ("5m", "5min"):
-            return "CANDLE_INTERVAL_5_MIN"
-        if norm in ("15m", "15min"):
-            return "CANDLE_INTERVAL_15_MIN"
-        if norm in ("30m", "30min"):
-            return "CANDLE_INTERVAL_30_MIN"
-        if norm in ("1h", "60m", "hour"):
-            return "CANDLE_INTERVAL_HOUR"
-        if norm in ("1d", "1day", "day", "24h"):
-            return "CANDLE_INTERVAL_DAY"
-
-        # Fallback — час, чтобы не ломать код
-        return "CANDLE_INTERVAL_HOUR"
+        mapping = {
+            "1m": "CANDLE_INTERVAL_1_MIN", "1min": "CANDLE_INTERVAL_1_MIN",
+            "5m": "CANDLE_INTERVAL_5_MIN", "5min": "CANDLE_INTERVAL_5_MIN",
+            "15m": "CANDLE_INTERVAL_15_MIN", "15min": "CANDLE_INTERVAL_15_MIN",
+            "30m": "CANDLE_INTERVAL_30_MIN", "30min": "CANDLE_INTERVAL_30_MIN",
+            "1h": "CANDLE_INTERVAL_HOUR", "60m": "CANDLE_INTERVAL_HOUR", "hour": "CANDLE_INTERVAL_HOUR",
+            "1d": "CANDLE_INTERVAL_DAY", "day": "CANDLE_INTERVAL_DAY", "24h": "CANDLE_INTERVAL_DAY"
+        }
+        return mapping.get(norm, "CANDLE_INTERVAL_HOUR")
 
     @staticmethod
     def _max_delta_for_interval(interval: str) -> timedelta:
-        """
-        Максимальный допустимый период для одного запроса GetCandles.
-        """
         norm = interval.lower()
-
-        # 1–15 минут → до 1 дня
-        if norm in (
-            "1m", "1min",
-            "2m", "2min",
-            "3m", "3min",
-            "5m", "5min",
-            "10m", "10min",
-            "15m", "15min",
-        ):
+        if norm in ("1m", "1min", "2m", "3m", "5m", "10m", "15m"):
             return timedelta(days=1)
-
-        # 30 минут → до 2 дней
         if norm in ("30m", "30min"):
             return timedelta(days=2)
-
-        # 1 час → до 1 недели
         if norm in ("1h", "60m", "hour"):
             return timedelta(days=7)
-
-        # 1 день → до 1 года
-        if norm in ("1d", "1day", "day", "24h"):
-            return timedelta(days=365)
-
-        # всё остальное — консервативный дефолт: 31 день
-        return timedelta(days=31)
+        return timedelta(days=365)
 
     @staticmethod
     def _q_to_float(q: Dict[str, Any]) -> float:
-        """
-        Quotation {units, nano} -> float.
-        """
-        if not q:
-            return 0.0
-        units = float(q.get("units", 0))
-        nano = float(q.get("nano", 0)) / 1e9
-        return units + nano
+        if not q: return 0.0
+        return float(q.get("units", 0)) + float(q.get("nano", 0)) / 1e9
 
-    @staticmethod
-    def _resolve_figi(symbol: str) -> str:
-        """
-        Маппинг тикера (SBER, GAZP...) -> FIGI.
-
-        Берём из Config.TINKOFF_FIGI_MAP.
-        """
-        from config import Config  # локальный импорт, чтобы не ловить циклы
-
+    def _resolve_figi(self, symbol: str) -> str:
+        if symbol in self._figi_cache:
+            return self._figi_cache[symbol]
+        from config import Config
         figi_map = getattr(Config, "TINKOFF_FIGI_MAP", {})
         figi = figi_map.get(symbol)
         if not figi:
-            raise KeyError(
-                f"TinkoffV2Broker: не найден FIGI для символа '{symbol}'. "
-                f"Добавь его в Config.TINKOFF_FIGI_MAP."
-            )
+            raise KeyError(f"TinkoffV2Broker: не найден FIGI для '{symbol}'.")
+        self._figi_cache[symbol] = figi
         return figi
-    
-    @staticmethod
-    def _resolve_ticker(figi: str) -> str:
-        """
-        Reverse-map FIGI -> TICKER через Config.TINKOFF_FIGI_MAP.
-        Если FIGI не найден — возвращаем исходный figi (fallback).
-        """
-        from config import Config  # локальный импорт, чтобы не ловить циклы
 
+    def _resolve_ticker(self, figi: str) -> str:
+        from config import Config
         figi_map = getattr(Config, "TINKOFF_FIGI_MAP", {}) or {}
-        # P0.5+: строим обратный мап на лету (в P0 достаточно; позже можно кэшировать)
-        reverse = {v: k for k, v in figi_map.items() if v}
-        return reverse.get(figi, figi)
+        for k, v in figi_map.items():
+            if v == figi:
+                return k
+        return figi
 
-    def _post_with_backoff(
-        self,
-        url: str,
-        payload: Dict[str, Any],
-        timeout: int = 10,
-        is_history: bool = False,
-    ) -> requests.Response:
-        """
-        POST-запрос с:
-          - экспоненциальным backoff'ом на 429;
-          - учётом глобального лимита для исторических свечей (is_history=True).
-        """
+    async def _post_with_backoff(self, url: str, payload: Dict[str, Any], is_history: bool = False) -> Dict[str, Any]:
+        if self.session is None:
+            await self.initialize()
+
         max_attempts = 5
-        backoff = 0.5  # стартовая задержка
+        backoff = 0.5
 
         for attempt in range(1, max_attempts + 1):
-            # глобальный rate-limit для GetCandles
+            # --- Rate Limit Logic with Lock ---
             if is_history:
-                now = time.time()
-                elapsed = now - self._last_history_call_ts
-                wait = self._history_min_interval - elapsed
-                if wait > 0:
-                    time.sleep(wait)
-                self._last_history_call_ts = time.time()
+                async with self._rate_limit_lock:  # Блокируем, чтобы только один поток проверял таймер
+                    now = time.time()
+                    elapsed = now - self._last_history_call_ts
+                    wait = self._history_min_interval - elapsed
+                    if wait > 0:
+                        await asyncio.sleep(wait)
+                    self._last_history_call_ts = time.time() # Обновляем время ПОСЛЕ сна, но внутри лока
 
             try:
-                resp = self.session.post(
-                    url, data=json.dumps(payload), timeout=timeout
-                )
-                resp.raise_for_status()
-                return resp
+                async with self.session.post(url, json=payload) as resp:
+                    if resp.status == 429:
+                        print(f"[TINKOFF] 429 Rate Limit. Waiting {backoff:.2f}s...")
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    if resp.status >= 500:
+                        print(f"[TINKOFF] Server Error {resp.status}. Retry...")
+                        await asyncio.sleep(backoff)
+                        backoff *= 2
+                        continue
+                    
+                    resp.raise_for_status()
+                    return await resp.json()
 
-            except requests.HTTPError as e:
-                status = e.response.status_code if e.response is not None else None
-                # 429 — ждём и повторяем
-                if status == 429 and attempt < max_attempts:
-                    print(
-                        f"[TINKOFF V2] 429 Too Many Requests "
-                        f"(попытка {attempt}/{max_attempts}), "
-                        f"ждём {backoff:.1f} c..."
-                    )
-                    time.sleep(backoff)
-                    backoff *= 2
-                    continue
-                # другие статусы — пробрасываем
-                raise
-
-            except requests.RequestException as e:
-                # сетевые ошибки/таймауты — тоже с бэкоффом
+            except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                 if attempt < max_attempts:
-                    print(
-                        f"[TINKOFF V2] сетевой сбой/таймаут: {e} "
-                        f"(попытка {attempt}/{max_attempts}), "
-                        f"ждём {backoff:.1f} c..."
-                    )
-                    time.sleep(backoff)
+                    print(f"[TINKOFF] Network error: {e}. Retry {attempt}...")
+                    await asyncio.sleep(backoff)
                     backoff *= 2
-                    continue
-                raise
+                else:
+                    raise
 
-        raise RuntimeError("TinkoffV2Broker: исчерпаны попытки запроса к API.")
+        raise RuntimeError(f"TinkoffV2Broker: Failed request to {url}")
 
-    # ---------------------------------------------------------------------
-    # Sync-хелпер для свечей
-    # ---------------------------------------------------------------------
+    async def _get_lot_size(self, figi: str) -> int:
+        if figi in self._lot_sizes:
+            return self._lot_sizes[figi]
+        url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy"
+        payload = {"idType": "INSTRUMENT_ID_TYPE_FIGI", "id": figi}
+        try:
+            data = await self._post_with_backoff(url, payload)
+            item = data.get("instrument", {})
+            lot = int(item.get("lot", 1))
+            self._lot_sizes[figi] = max(1, lot)
+            return self._lot_sizes[figi]
+        except Exception as e:
+            print(f"[WARN] Failed to get lot size for {figi}: {e}")
+            return 1
 
-    def _get_historical_klines_sync(
-        self,
-        symbol: str,
-        interval: str,
-        start: datetime,
-        end: datetime,
-    ) -> pd.DataFrame:
-        # --- Нормализуем время в UTC ---
-        if start.tzinfo is None:
-            start = start.replace(tzinfo=timezone.utc)
-        else:
-            start = start.astimezone(timezone.utc)
+    # =====================================================================
+    # Market Data
+    # =====================================================================
 
-        if end.tzinfo is None:
-            end = end.replace(tzinfo=timezone.utc)
-        else:
-            end = end.astimezone(timezone.utc)
-
+    async def get_historical_klines(self, symbol: str, interval: str, start: datetime, end: datetime) -> pd.DataFrame:
+        if start.tzinfo is None: start = start.replace(tzinfo=timezone.utc)
+        if end.tzinfo is None: end = end.replace(tzinfo=timezone.utc)
+        
+        # Важно: сохраняем структуру колонок для совместимости с стратегиями
+        columns = ["open", "high", "low", "close", "volume", "taker_buy_base", "funding_rate", "imbalance"]
+        
         if end <= start:
-            # Пустой диапазон — сразу отдаём пустой DF в ожидаемом формате
-            return pd.DataFrame(
-                columns=[
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                    "taker_buy_base",
-                    "funding_rate",
-                    "imbalance",
-                ]
-            )
+            return pd.DataFrame(columns=columns)
 
         figi = self._resolve_figi(symbol)
         interval_enum = self._interval_to_v2_enum(interval)
         max_delta = self._max_delta_for_interval(interval)
-
-        url = (
-            f"{self.base_url}/"
-            "tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles"
-        )
-
-        rows: list[dict] = []
+        
+        url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.MarketDataService/GetCandles"
+        
+        all_rows = []
         cur_from = start
-
+        
         chunk_idx = 0
-        max_chunks = 1000  # защита от безумия на очень больших диапазонах
+        max_chunks = 2000 # Защита от бесконечного цикла
 
         while cur_from < end and chunk_idx < max_chunks:
             chunk_idx += 1
             cur_to = min(cur_from + max_delta, end)
-
+            
             payload = {
                 "figi": figi,
                 "from": self._to_rfc3339(cur_from),
@@ -317,385 +220,222 @@ class TinkoffV2Broker(BrokerAPI):
             }
 
             try:
-                resp = self._post_with_backoff(
-                    url, payload, timeout=10, is_history=True
-                )
-                raw = resp.json()
-            except Exception as e:
-                print(
-                    f"[TINKOFF V2] Candles request failed for {symbol} "
-                    f"({interval}, {cur_from}..{cur_to}): {e}"
-                )
-                break
-
-            candles = raw.get("candles", [])
-            if not candles:
-                cur_from = cur_to
-                continue
-
-            for c in candles:
-                try:
-                    ts = datetime.fromisoformat(
-                        c["time"].replace("Z", "+00:00")
-                    ).astimezone(timezone.utc).replace(tzinfo=None)
-
-                    rows.append(
-                        {
-                            "open_time": ts,
-                            "open": self._q_to_float(c.get("open", {})),
-                            "high": self._q_to_float(c.get("high", {})),
-                            "low": self._q_to_float(c.get("low", {})),
-                            "close": self._q_to_float(c.get("close", {})),
-                            "volume": float(c.get("volume", 0)),
-                            "taker_buy_base": 0.0,
-                            "funding_rate": 0.0,
-                            "imbalance": 0.0,
-                        }
-                    )
-                except Exception as e:
-                    print(f"[TINKOFF V2] skip bad candle: {e}")
+                data = await self._post_with_backoff(url, payload, is_history=True)
+                candles = data.get("candles", [])
+                
+                if not candles:
+                    cur_from = cur_to
                     continue
 
-            cur_from = cur_to
+                for c in candles:
+                    ts_str = c["time"]
+                    ts = datetime.fromisoformat(ts_str.replace("Z", "+00:00")).replace(tzinfo=None)
+                    
+                    row = {
+                        "open_time": ts,
+                        "open": self._q_to_float(c.get("open")),
+                        "high": self._q_to_float(c.get("high")),
+                        "low": self._q_to_float(c.get("low")),
+                        "close": self._q_to_float(c.get("close")),
+                        "volume": float(c.get("volume", 0)),
+                        # Заглушки для совместимости с крипто-стратегиями
+                        "taker_buy_base": 0.0,
+                        "funding_rate": 0.0,
+                        "imbalance": 0.0,
+                    }
+                    all_rows.append(row)
+                
+                cur_from = cur_to
 
-        if not rows:
-            return pd.DataFrame(
-                columns=[
-                    "open",
-                    "high",
-                    "low",
-                    "close",
-                    "volume",
-                    "taker_buy_base",
-                    "funding_rate",
-                    "imbalance",
-                ]
-            )
+            except Exception as e:
+                print(f"[TINKOFF] Error fetching candles: {e}")
+                break
 
-        df = pd.DataFrame(rows)
+        if not all_rows:
+            return pd.DataFrame(columns=columns)
+
+        df = pd.DataFrame(all_rows)
         df.drop_duplicates(subset=["open_time"], keep="last", inplace=True)
         df.sort_values("open_time", inplace=True)
         df.set_index("open_time", inplace=True)
-
-        return df[
-            [
-                "open",
-                "high",
-                "low",
-                "close",
-                "volume",
-                "taker_buy_base",
-                "funding_rate",
-                "imbalance",
-            ]
-        ]
-
-    # ---------------------------------------------------------------------
-    # Sync-хелпер для цены
-    # ---------------------------------------------------------------------
-
-    # [NEW] Вспомогательный метод получения лотности
-    def _get_lot_size_sync(self, figi: str) -> int:
-        """Получает размер лота для инструмента (синхронно)."""
-        if figi in self._lot_sizes:
-            return self._lot_sizes[figi]
-            
-        url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.InstrumentsService/GetInstrumentBy"
-        payload = {"idType": "INSTRUMENT_ID_TYPE_FIGI", "id": figi}
         
-        try:
-            resp = self._post_with_backoff(url, payload, is_history=False)
-            data = resp.json()
-            item = data.get("instrument", {})
-            lot = int(item.get("lot", 1))
-            if lot < 1: lot = 1
-            
-            self._lot_sizes[figi] = lot
-            return lot
-        except Exception as e:
-            print(f"[WARN] Tinkoff: failed to get lot size for {figi}: {e}")
-            return 1 # Fallback
-
-
-    def _get_current_price_sync(self, symbol: str) -> float:
-        figi = self._resolve_figi(symbol)
-
-        url = (
-            f"{self.base_url}/"
-            "tinkoff.public.invest.api.contract.v1.MarketDataService/GetLastPrices"
-        )
-        payload = {"instrumentId": [figi]}
-
-        try:
-            resp = self.session.post(
-                url, data=json.dumps(payload), timeout=5
-            )
-            resp.raise_for_status()
-            data = resp.json()
-        except Exception as e:
-            raise RuntimeError(f"TinkoffV2Broker: price request failed for {symbol}: {e}")
-
-        prices = data.get("lastPrices", [])
-        if not prices:
-            raise RuntimeError(
-                f"TinkoffV2Broker: no price data for FIGI={figi} (symbol={symbol})"
-            )
-
-        price_obj = prices[0].get("price", {})
-        return self._q_to_float(price_obj)
-
-    def _get_accounts_sync(self) -> list[dict]:
-        url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts"
-        resp = self._post_with_backoff(url, payload={}, timeout=10, is_history=False)
-        return resp.json().get("accounts", []) or []
-
-    def _get_portfolio_sync(self, account_id: str) -> dict:
-        url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OperationsService/GetPortfolio"
-        payload = {"accountId": account_id}
-        resp = self._post_with_backoff(url, payload=payload, timeout=10, is_history=False)
-        return resp.json() or {}
-
-    # =====================================================================
-    # BrokerAPI: MARKET DATA (async-обёртки)
-    # =====================================================================
-
-    async def get_historical_klines(
-        self,
-        symbol: str,
-        interval: str,
-        start: datetime,
-        end: datetime,
-    ) -> pd.DataFrame:
-        return await asyncio.to_thread(
-            self._get_historical_klines_sync,
-            symbol,
-            interval,
-            start,
-            end,
-        )
+        return df[columns]
 
     async def get_current_price(self, symbol: str) -> float:
-        return await asyncio.to_thread(
-            self._get_current_price_sync,
-            symbol,
-        )
+        figi = self._resolve_figi(symbol)
+        url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.MarketDataService/GetLastPrices"
+        payload = {"instrumentId": [figi]}
+        data = await self._post_with_backoff(url, payload)
+        prices = data.get("lastPrices", [])
+        if not prices:
+            raise RuntimeError(f"No price for {symbol}")
+        return self._q_to_float(prices[0].get("price"))
 
     # =====================================================================
-    # BrokerAPI: ACCOUNT / TRADING (пока заглушки)
+    # Trading / Account
     # =====================================================================
 
     async def get_account_state(self) -> AccountState:
-        def _sync():
-            accounts = self._get_accounts_sync()
-            if not accounts:
-                return AccountState(equity=0.0, balance=0.0, currency="RUB", margin_used=0.0, broker=self.name)
+        url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts"
+        data = await self._post_with_backoff(url, {})
+        accounts = data.get("accounts", [])
+        if not accounts:
+             return AccountState(equity=0.0, balance=0.0, currency="RUB", margin_used=0.0, broker=self.name)
 
-            # P0: берём первый аккаунт
-            account_id = accounts[0].get("id") or accounts[0].get("accountId")
-            if not account_id:
-                return AccountState(equity=0.0, balance=0.0, currency="RUB", margin_used=0.0, broker=self.name)
+        aid = accounts[0].get("id")
+        pf_url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OperationsService/GetPortfolio"
+        pf_data = await self._post_with_backoff(pf_url, {"accountId": aid})
+        
+        total = self._q_to_float(pf_data.get("totalAmountPortfolio", {}))
+        cash = self._q_to_float(pf_data.get("totalAmountCurrencies", {}))
+        
+        return AccountState(equity=total, balance=cash, currency="RUB", margin_used=0.0, broker=self.name)
 
-            pf = self._get_portfolio_sync(account_id)
-            total = self._q_to_float(pf.get("totalAmountPortfolio", {}))
-            cash = self._q_to_float(pf.get("totalAmountCurrencies", {}))
-
-            # Валюта у total/cash может быть в других полях, но для P0 фиксируем RUB
-            return AccountState(equity=total, balance=cash, currency="RUB", margin_used=0.0, broker=self.name)
-
-        return await asyncio.to_thread(_sync)
-    
     async def list_open_positions(self) -> List[Position]:
-        def _sync():
-            accounts = self._get_accounts_sync()
-            if not accounts:
-                return []
+        acc_url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts"
+        acc_data = await self._post_with_backoff(acc_url, {})
+        accounts = acc_data.get("accounts", [])
+        if not accounts: return []
+        aid = accounts[0].get("id")
 
-            account_id = accounts[0].get("id") or accounts[0].get("accountId")
-            if not account_id:
-                return []
-
-            pf = self._get_portfolio_sync(account_id)
-            raw_pos = pf.get("positions", []) or []
-
-            result: list[Position] = []
-            for p in raw_pos:
-                figi = p.get("figi")
-                qty = self._q_to_float(p.get("quantity", {}))
-                avg = self._q_to_float(p.get("averagePositionPrice", {}))
-
-                if qty == 0:
-                    continue
-
-                # P0.5+: унифицируем symbol как тикер через Config.TINKOFF_FIGI_MAP
-                symbol = self._resolve_ticker(figi or "")
-                result.append(
-                    Position(
-                        symbol=symbol,            # тикер (SBER, GAZP...)
-                        instrument_id=figi or "", # FIGI как идентификатор инструмента
-                        quantity=qty,
-                        avg_price=avg,
-                        unrealized_pnl=None,
-                        broker=self.name,
-                    )
-                )
-            return result
-
-        return await asyncio.to_thread(_sync)
+        pf_url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OperationsService/GetPortfolio"
+        pf_data = await self._post_with_backoff(pf_url, {"accountId": aid})
+        
+        raw_pos = pf_data.get("positions", [])
+        result = []
+        for p in raw_pos:
+            figi = p.get("figi")
+            qty = self._q_to_float(p.get("quantity", {}))
+            if qty == 0: continue
+            
+            avg = self._q_to_float(p.get("averagePositionPrice", {}))
+            last = self._q_to_float(p.get("currentPrice", {})) 
+            symbol = self._resolve_ticker(figi)
+            
+            pos = Position(
+                symbol=symbol,
+                instrument_id=figi,
+                quantity=qty,
+                avg_price=avg,
+                last_price=last if last > 0 else avg,
+                unrealized_pnl=self._q_to_float(p.get("expectedYield", {})),
+                broker=self.name
+            )
+            result.append(pos)
+        return result
 
     async def place_order(self, order: OrderRequest) -> OrderResult:
-        def _sync():
-            accounts = self._get_accounts_sync()
-            if not accounts:
-                raise RuntimeError("TinkoffV2Broker: no accounts available")
+        # 1. Account
+        acc_url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts"
+        acc_data = await self._post_with_backoff(acc_url, {})
+        if not acc_data.get("accounts"): raise RuntimeError("No accounts")
+        aid = acc_data["accounts"][0]["id"]
 
-            account_id = accounts[0].get("id") or accounts[0].get("accountId")
-            if not account_id:
-                raise RuntimeError("TinkoffV2Broker: accountId missing")
-
-            # symbol ожидаем как тикер → FIGI
-            figi = self._resolve_figi(order.symbol)
+        # 2. Prep
+        figi = self._resolve_figi(order.symbol)
+        lot_size = await self._get_lot_size(figi)
+        
+        # [CRITICAL FIX] Защита от floating point dust (9.9999 -> 10.0)
+        # Добавляем epsilon перед делением, чтобы компенсировать погрешность вниз
+        raw_qty = float(order.quantity)
+        lots = int((raw_qty + 1e-9) // lot_size) 
+        
+        if lots <= 0:
+            raise ValueError(f"Quantity {raw_qty} is less than 1 lot ({lot_size}) for {order.symbol}")
             
-            # [FIX] Получаем лотность и считаем лоты
-            lot_size = self._get_lot_size_sync(figi)
-            raw_qty = float(order.quantity)
-            lots = int(raw_qty // lot_size) # Целое количество лотов
+        direction = "ORDER_DIRECTION_BUY" if order.side == "buy" else "ORDER_DIRECTION_SELL"
+        o_type = "ORDER_TYPE_MARKET" if order.order_type == "market" else "ORDER_TYPE_LIMIT"
+        
+        payload = {
+            "accountId": aid,
+            "figi": figi,
+            "quantity": lots,
+            "direction": direction,
+            "orderType": o_type,
+            "orderId": order.client_id or f"bot-{int(time.time()*1000)}"
+        }
+        
+        if order.order_type == "limit":
+            pr = float(order.price)
+            u = int(pr)
+            n = int(round((pr - u) * 1e9))
+            payload["price"] = {"units": str(u), "nano": n}
 
-            if lots <= 0:
-                raise ValueError(f"Tinkoff: Quantity {raw_qty} is less than 1 lot ({lot_size}) for {order.symbol}")
-
-            url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder"
-            direction = "ORDER_DIRECTION_BUY" if order.side == "buy" else "ORDER_DIRECTION_SELL"
-            order_type = "ORDER_TYPE_MARKET" if order.order_type == "market" else "ORDER_TYPE_LIMIT"
-
-            payload = {
-                "accountId": account_id,
-                "figi": figi,
-                "quantity": lots,  # [FIX] Отправляем ЛОТЫ
-                "direction": direction,
-                "orderType": order_type,
-                "orderId": order.client_id or f"bot-{int(time.time()*1000)}",
-            }
-
-            # limit price, если нужен
-            if order.order_type == "limit":
-                # price -> quotation
-                pr = float(order.price or 0.0)
-                units = int(pr)
-                nano = int(round((pr - units) * 1e9))
-                payload["price"] = {"units": str(units), "nano": nano}
-
-            resp = self._post_with_backoff(url, payload=payload, timeout=10, is_history=False)
-            data = resp.json() or {}
-
-            oid = data.get("orderId") or payload["orderId"]
-            exec_price = self._q_to_float(data.get("executedOrderPrice", {})) or float(order.price or 0.0)
-
-            # Возвращаем результат
-            # ВАЖНО: quantity возвращаем в ШТУКАХ (акциях), чтобы ledger считал правильно
-            real_quantity = float(lots * lot_size)
-
-            return OrderResult(
-                order_id=str(oid),
-                symbol=order.symbol,
-                side=order.side,
-                quantity=real_quantity,
-                price=float(exec_price),
-                status="filled",  # P0: считаем market как filled
-                broker=self.name,
-            )
-
-        return await asyncio.to_thread(_sync)
+        # 3. Exec
+        post_url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OrdersService/PostOrder"
+        resp_data = await self._post_with_backoff(post_url, payload)
+        
+        oid = resp_data.get("orderId")
+        exec_price = self._q_to_float(resp_data.get("executedOrderPrice", {}))
+        
+        return OrderResult(
+            order_id=oid,
+            symbol=order.symbol,
+            side=order.side,
+            quantity=float(lots * lot_size),
+            price=exec_price if exec_price > 0 else float(order.price or 0),
+            status="filled",
+            broker=self.name
+        )
 
     async def cancel_order(self, order_id: str, symbol: str | None = None) -> None:
-        def _sync():
-            accounts = self._get_accounts_sync()
-            if not accounts:
-                return
-            account_id = accounts[0].get("id") or accounts[0].get("accountId")
-            if not account_id:
-                return
+        acc_url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts"
+        acc_data = await self._post_with_backoff(acc_url, {})
+        if not acc_data.get("accounts"): return
+        aid = acc_data["accounts"][0]["id"]
 
-            url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OrdersService/CancelOrder"
-            payload = {"accountId": account_id, "orderId": order_id}
-            self._post_with_backoff(url, payload=payload, timeout=10, is_history=False)
-
-        await asyncio.to_thread(_sync)
+        url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OrdersService/CancelOrder"
+        await self._post_with_backoff(url, {"accountId": aid, "orderId": order_id})
 
     async def get_open_orders(self, symbol: str) -> List[OrderResult]:
-        def _sync():
-            accounts = self._get_accounts_sync()
-            if not accounts:
-                return []
-            account_id = accounts[0].get("id") or accounts[0].get("accountId")
-            if not account_id:
-                return []
+        acc_url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts"
+        acc_data = await self._post_with_backoff(acc_url, {})
+        if not acc_data.get("accounts"): return []
+        aid = acc_data["accounts"][0]["id"]
 
-            url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OrdersService/GetOrders"
-            payload = {"accountId": account_id}
-            resp = self._post_with_backoff(url, payload=payload, timeout=10, is_history=False)
-            raw = resp.json() or {}
-            orders = raw.get("orders", []) or []
+        url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OrdersService/GetOrders"
+        data = await self._post_with_backoff(url, {"accountId": aid})
+        
+        orders = data.get("orders", [])
+        res = []
+        for o in orders:
+            res.append(OrderResult(
+                order_id=o.get("orderId"),
+                symbol=symbol,
+                side="buy" if o.get("direction") == "ORDER_DIRECTION_BUY" else "sell",
+                quantity=float(o.get("lotsRequested", 0)),
+                price=self._q_to_float(o.get("initialSecurityPrice", {})),
+                status="new",
+                broker=self.name
+            ))
+        return res
 
-            result: list[OrderResult] = []
-            for o in orders:
-                result.append(
-                    OrderResult(
-                        order_id=str(o.get("orderId", "")),
-                        symbol=symbol,
-                        side="buy" if o.get("direction") == "ORDER_DIRECTION_BUY" else "sell",
-                        quantity=float(o.get("lotsRequested", 0) or 0),
-                        price=self._q_to_float(o.get("initialSecurityPrice", {})),
-                        status=str(o.get("executionReportStatus", "new")),
-                        broker=self.name,
-                    )
-                )
-            return result
-
-        return await asyncio.to_thread(_sync)
+    # =====================================================================
+    # [RESTORED] Missing Methods for GUI / Kill-Switch
+    # =====================================================================
 
     async def list_active_orders(self, symbol: str | None = None) -> List[OrderResult]:
-        """Активные заявки по счету (для kill-switch)."""
         return await self.get_open_orders(symbol or "")
 
-    async def get_order_info(
-        self,
-        *,
-        order_id: str | None = None,
-        client_id: str | None = None,
-        symbol: str | None = None,
-    ) -> dict:
-        """Сырой статус заявки (GetOrderState). Для T-Invest используем order_id."""
+    async def get_order_info(self, *, order_id: str | None = None, client_id: str | None = None, symbol: str | None = None) -> dict:
         if not order_id and not client_id:
             raise ValueError("get_order_info: order_id or client_id required")
 
-        def _sync():
-            accounts = self._get_accounts_sync()
-            if not accounts:
-                return {}
-            account_id = accounts[0].get("id") or accounts[0].get("accountId")
-            if not account_id:
-                return {}
+        acc_url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.UsersService/GetAccounts"
+        acc_data = await self._post_with_backoff(acc_url, {})
+        if not acc_data.get("accounts"): return {}
+        aid = acc_data["accounts"][0]["id"]
 
-            url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OrdersService/GetOrderState"
-            payload = {
-                "accountId": account_id,
-                "orderId": str(order_id or client_id),
-                "orderIdType": "ORDER_ID_TYPE_REQUEST",
-            }
-            resp = self._post_with_backoff(url, payload=payload, timeout=10, is_history=False)
-            return resp.json() or {}
+        url = f"{self.base_url}/tinkoff.public.invest.api.contract.v1.OrdersService/GetOrderState"
+        payload = {
+            "accountId": aid,
+            "orderId": str(order_id or client_id),
+            "orderIdType": "ORDER_ID_TYPE_REQUEST",
+        }
+        resp = await self._post_with_backoff(url, payload)
+        return resp or {}
 
-        return await asyncio.to_thread(_sync)
-
-    async def wait_for_order_final(
-        self,
-        *,
-        order_id: str | None = None,
-        client_id: str | None = None,
-        symbol: str | None = None,
-        timeout_s: float = 30.0,
-        poll_s: float = 0.7,
-    ) -> OrderResult:
+    async def wait_for_order_final(self, *, order_id: str | None = None, client_id: str | None = None, symbol: str | None = None, timeout_s: float = 30.0, poll_s: float = 0.7) -> OrderResult:
         deadline = time.time() + float(timeout_s)
         last: dict = {}
 
@@ -713,57 +453,50 @@ class TinkoffV2Broker(BrokerAPI):
         lots_exec = float(last.get("lotsExecuted") or 0)
         lots_req = float(last.get("lotsRequested") or 0)
 
-        if "REJECT" in status_raw:
-            norm_status = "rejected"
-        elif "CANCEL" in status_raw:
-            norm_status = "canceled"
-        elif "FILL" in status_raw:
-            norm_status = "filled"
-        elif lots_exec > 0:
-            norm_status = "submitted"
-        else:
-            norm_status = "unknown"
+        norm_status = "unknown"
+        if "REJECT" in status_raw: norm_status = "rejected"
+        elif "CANCEL" in status_raw: norm_status = "canceled"
+        elif "FILL" in status_raw: norm_status = "filled"
+        elif lots_exec > 0: norm_status = "submitted"
 
         direction = str(last.get("direction") or "")
         side = "buy" if direction == "ORDER_DIRECTION_BUY" else "sell" if direction == "ORDER_DIRECTION_SELL" else "buy"
-
+        
         price_q = last.get("executedOrderPrice") or {}
-        try:
-            avg = float(self._q_to_float(price_q))
-        except Exception:
-            avg = 0.0
+        try: avg = float(self._q_to_float(price_q))
+        except: avg = 0.0
 
         figi = str(last.get("figi") or "")
         sym = symbol or (self._resolve_ticker(figi) if figi else "")
-
         qty = lots_exec if lots_exec > 0 else lots_req
-
         oid = str(last.get("orderId") or (order_id or client_id or ""))
 
         return OrderResult(
-            order_id=oid,
-            symbol=sym,
-            side=side,
-            quantity=float(qty),
-            price=float(avg),
-            status=norm_status,
-            broker=self.name,
+            order_id=oid, symbol=sym, side=side, quantity=float(qty),
+            price=float(avg), status=norm_status, broker=self.name
         )
 
     async def close_position(self, symbol: str, reason: str = "") -> None:
-        """Закрыть позицию по тикеру: отправляем рыночную заявку в противоположную сторону."""
+        """
+        Закрыть позицию. 
+        ВАЖНО: Метод теперь отправляет сырое количество (абсолютное значение),
+        а place_order сам разбирается с округлением до лотов через (raw + epsilon) // lot_size.
+        """
         positions = await self.list_open_positions()
         pos = next((p for p in positions if p.symbol == symbol), None)
-        if not pos:
-            return
+        if not pos: return
         qty = abs(float(pos.quantity))
-        if qty <= 0:
-            return
-        lots = int(round(qty))
-        if lots <= 0:
-            return
+        if qty <= 1e-9: return # Защита от микро-пыли
 
         side = "sell" if float(pos.quantity) > 0 else "buy"
         client_id = f"kill-{int(time.time()*1000)}-{symbol}"
-        req = OrderRequest(symbol=symbol, side=side, quantity=lots, order_type="market", client_id=client_id)
+        
+        # Просто передаем количество, place_order сделает всё остальное.
+        req = OrderRequest(
+            symbol=symbol, 
+            side=side, 
+            quantity=qty, 
+            order_type="market", 
+            client_id=client_id
+        )
         await self.place_order(req)
