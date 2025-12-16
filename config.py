@@ -54,7 +54,6 @@ CRYPTO_UNIVERSE = [
     {"symbol": "BNBUSDT", "group": "major", "quote": "USDT"}, # Listing: Jul 2017 (Native)
     {"symbol": "LTCUSDT", "group": "major", "quote": "USDT"}, # Listing: 2017
     {"symbol": "NEOUSDT", "group": "old",   "quote": "USDT"}, # Listing: 2017
-    {"symbol": "IOTAUSDT","group": "old",   "quote": "USDT"}, # Listing: 2017
     {"symbol": "ETCUSDT", "group": "old",   "quote": "USDT"}, # Listing: 2017
 
     # --- Class of late 2017 / early 2018 ---

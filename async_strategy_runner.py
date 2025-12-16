@@ -1505,6 +1505,86 @@ class AsyncStrategyRunner:
 
         print(f"✅ ENTRY {symbol}: qty={qty} price≈{current_price} p={probability:.3f} risk={risk_per_trade:.4f}")
 
+    def request_stop(self):
+            """
+            Мягкая остановка цикла run_forever.
+            """
+            self._keep_running = False
+
+    async def run_forever(self, risk_per_trade: float | None = None, sleep_interval: float = 10.0) -> None:
+        """
+        Бесконечный цикл запуска стратегии (для GUI и CLI).
+        Содержит логику Watchdog Heartbeat, Kill-Switch и обработки ошибок.
+        """
+        self._keep_running = True
+        
+        # Читаем лимит ошибок из конфига
+        max_errors = int(getattr(Config, "RUNNER_MAX_CONSECUTIVE_ERRORS", 5) or 5)
+        if max_errors < 1: 
+            max_errors = 1
+        consecutive_errors = 0
+        
+        kill_path = getattr(Config, "KILL_SWITCH_FILE", os.path.join(self._state_dir, "kill_switch.json"))
+        os.makedirs(os.path.dirname(kill_path) or ".", exist_ok=True)
+        
+        print(f"🧯 Auto kill-switch armed: {max_errors} consecutive errors → close all & exit")
+
+        while self._keep_running:
+            # 1. Heartbeat (начало цикла)
+            self._touch_heartbeat("alive", note="loop_top")
+
+            # 2. Kill-Switch Check
+            if self._kill_switch_enabled():
+                self._touch_heartbeat("stopped", note="kill_switch_enabled")
+                await self._handle_kill_switch(reason="manual_or_guard")
+                return
+
+            # 3. Strategy Execution
+            try:
+                await self.run_strategy(risk_per_trade=risk_per_trade)
+                
+                # Успех -> сбрасываем счетчик ошибок
+                consecutive_errors = 0 
+                self._touch_heartbeat("ok", note="cycle_ok", extra={"consecutive_errors": consecutive_errors})
+                
+            except asyncio.CancelledError:
+                self._touch_heartbeat("stopped", note="cancelled")
+                # Пробрасываем отмену, чтобы корректно выйти из таска
+                raise 
+                
+            except Exception as e:
+                # Обработка ошибок
+                await self.alerter.send(f"🔴 Runner ERROR ({consecutive_errors}/{max_errors}): {e}")
+                consecutive_errors += 1
+                self._touch_heartbeat("error", note="cycle_error", extra={"error": str(e), "consecutive_errors": consecutive_errors})
+                print(f"[FATAL] runner loop error ({consecutive_errors}/{max_errors}): {e}")
+
+                # Если превышен лимит ошибок -> Kill Switch
+                if consecutive_errors >= max_errors:
+                    reason = f"auto_max_consecutive_errors:{consecutive_errors}"
+                    atomic_write_json(
+                        kill_path,
+                        {
+                            "enabled": True,
+                            "reason": reason,
+                            "enabled_at": datetime.utcnow().isoformat(),
+                            "consecutive_errors": consecutive_errors,
+                            "last_error": str(e),
+                        },
+                    )
+                    self._touch_heartbeat("stopped", note="auto_kill_switch", extra={"reason": reason})
+                    await self._handle_kill_switch(reason=reason)
+                    return
+
+            # 4. Sleep
+            self._touch_heartbeat("alive", note="sleeping", extra={"sleep_s": sleep_interval})
+            try:
+                # Спим, проверяя флаг остановки каждые 1 сек (для отзывчивости), 
+                # либо просто await asyncio.sleep(sleep_interval), т.к. CancelledError прервет сон.
+                await asyncio.sleep(sleep_interval)
+            except asyncio.CancelledError:
+                self._touch_heartbeat("stopped", note="cancelled_sleep")
+                raise
 
 async def _amain():
     # [FIX] Включаем логирование

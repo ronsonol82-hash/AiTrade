@@ -2298,15 +2298,23 @@ class FundManagerWindow(QMainWindow):
             self._set_live_quality_leds("red")
             return
 
-        # ok=True
-        # yellow if missing required broker or latency high
+        # 1. Проверка брокеров (если кого-то нет — сразу желтый)
         if (need_crypto and not bit_ok) or (need_stocks and not tink_ok):
             self._set_live_quality_leds("yellow")
             return
-        if latency_ms is not None and latency_ms > 2000:
-            self._set_live_quality_leds("yellow")
-            return
 
+        # 2. Проверка пинга (СИНХРОНИЗИРОВАНО С ТЕКСТОМ)
+        if latency_ms is not None:
+            if latency_ms >= 1000:
+                # Если текст красный — лампа тоже красная
+                self._set_live_quality_leds("red")
+                return
+            elif latency_ms >= 300:
+                # Если текст желтый — лампа желтая
+                self._set_live_quality_leds("yellow")
+                return
+
+        # Если все ок и пинг < 300
         self._set_live_quality_leds("green")
 
 
