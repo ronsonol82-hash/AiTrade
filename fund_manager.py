@@ -2246,8 +2246,20 @@ class FundManagerWindow(QMainWindow):
         # labels
         if hasattr(self, "lbl_live_last_refresh"):
             self.lbl_live_last_refresh.setText(f"Last refresh: {datetime.now().strftime('%H:%M:%S')}")
+        
+        # Улучшение отображения Latency
         if hasattr(self, "lbl_live_latency"):
-            self.lbl_live_latency.setText(f"Latency: {latency_ms} ms" if latency_ms is not None else "Latency: —")
+            if latency_ms is None:
+                self.lbl_live_latency.setText("Ping: —")
+                self.lbl_live_latency.setStyleSheet("color: #888;")
+            else:
+                self.lbl_live_latency.setText(f"Ping: {latency_ms} ms")
+                if latency_ms < 300:
+                    self.lbl_live_latency.setStyleSheet("color: #00e676; font-weight: bold;") # Bright Green
+                elif latency_ms < 1000:
+                    self.lbl_live_latency.setStyleSheet("color: #ffea00; font-weight: bold;") # Yellow
+                else:
+                    self.lbl_live_latency.setStyleSheet("color: #ff1744; font-weight: bold; font-size: 11pt;") # RED ALERT
 
         # expected brokers by universe mode
         need_crypto = True
