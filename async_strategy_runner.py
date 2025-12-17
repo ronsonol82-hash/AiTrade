@@ -30,11 +30,11 @@ class AsyncStrategyRunner:
       - Protections: native (plan orders) если возможно, иначе synthetic fallback
     """
 
-    def __init__(self, signals_file: str = "data_cache/production_signals_v1.pkl"):
+    def __init__(self,  router: ExecutionRouter | None = None, signals_file: str = "data_cache/production_signals_v1.pkl"):
         self.signals_file = signals_file
         self.signals: Dict[str, pd.DataFrame] = {}
         self.redis_bus = RedisSignalBus()
-        self.router = ExecutionRouter()
+        self.router = router if router is not None else ExecutionRouter()
 
         # LIVE safety: сериализуем торговые действия + блокируем новые ордера при kill-switch
         self._trading_lock = asyncio.Lock()
@@ -116,12 +116,71 @@ class AsyncStrategyRunner:
         # Сначала восстанавливаем память роутера, чтобы он знал о позициях
         await self.reconcile_state() 
         
+        # --- Reconcile Protections ---
         self._protections = atomic_read_json(self._protections_file, {}) or {}
-        if self._protections:
-            print(f"🛡️  Restored protections: {len(self._protections)}")
+        self._reconcile_protections()
 
         # (4) reconcile ledger (это старый метод, он сверяет базу данных сделок)
         await self._reconcile_on_startup()
+    
+    def _reconcile_protections(self) -> None:
+        """
+        Синхронизирует protections с реальными позициями роутера.
+        - Удаляет protections для символов без позиции (SL/TP сработал пока бот был выключен)
+        - Предупреждает о позициях без protections (открыты вручную или потеряны)
+        """
+        if not self._protections:
+            return
+        
+        # Получаем символы с реальными позициями
+        active_symbols = set(self.router._active_positions.keys())
+        protection_symbols = set(self._protections.keys())
+        
+        # 1) Удаляем "мёртвые" protections (позиция закрылась на бирже)
+        orphaned_protections = protection_symbols - active_symbols
+        for sym in orphaned_protections:
+            prot = self._protections.pop(sym, {})
+            print(f"🧹 [RECONCILE] Removed orphaned protection for {sym} (position closed on exchange)")
+            
+            # Закрываем trade в ledger если есть
+            trade_id = prot.get("trade_id")
+            if trade_id:
+                try:
+                    # Используем 0.0 как exit_price т.к. не знаем реальную цену закрытия
+                    self.ledger.close_trade(trade_id, 0.0, "reconcile_protection_orphaned")
+                except Exception as e:
+                    print(f"   [WARN] Failed to close trade {trade_id}: {e}")
+        
+        # 2) Предупреждаем о позициях без protections
+        unprotected_positions = active_symbols - protection_symbols
+        for sym in unprotected_positions:
+            pos_info = self.router._active_positions.get(sym, {})
+            print(f"⚠️  [RECONCILE] Position {sym} has NO protections! Size: {pos_info.get('size', '?')}")
+            # TODO: можно автоматически поставить synthetic SL на основе ATR
+        
+        # 3) Синхронизируем qty/entry_price в существующих protections
+        for sym in (protection_symbols & active_symbols):
+            pos_info = self.router._active_positions.get(sym, {})
+            prot = self._protections.get(sym, {})
+            
+            real_qty = pos_info.get('size', 0.0)
+            real_entry = pos_info.get('entry_price', 0.0)
+            
+            # Обновляем если есть расхождение
+            if prot.get("qty") != real_qty:
+                print(f"🔄 [RECONCILE] {sym}: qty {prot.get('qty')} -> {real_qty}")
+                prot["qty"] = real_qty
+            
+            if real_entry > 0 and prot.get("entry_price", 0) != real_entry:
+                print(f"🔄 [RECONCILE] {sym}: entry_price {prot.get('entry_price')} -> {real_entry}")
+                prot["entry_price"] = real_entry
+        
+        # 4) Сохраняем очищенные protections
+        if orphaned_protections:
+            self._persist_protections()
+            print(f"🛡️  Reconciled protections: {len(self._protections)} active")
+        elif self._protections:
+            print(f"🛡️  Restored protections: {len(self._protections)}")
 
     def set_assets(self, assets: list[str]):
         self.assets_filter = list(assets) if assets else None
@@ -532,10 +591,23 @@ class AsyncStrategyRunner:
         if cooldown_s > 0 and last_ts > 0 and (now_ts - last_ts) < cooldown_s:
             return False
 
-        # --- local high watermark ---
-        prev_max = _f(prot.get("max_price"), 0.0)
-        max_price = max(prev_max, cp)
-        prot["max_price"] = max_price
+        # --- local price watermark (max for LONG, min for SHORT) ---
+        if qty > 0:
+            # LONG: отслеживаем максимум цены
+            prev_max = _f(prot.get("max_price"), 0.0)
+            if prev_max <= 0:
+                prev_max = cp
+            max_price = max(prev_max, cp)
+            prot["max_price"] = max_price
+            watermark_price = max_price
+        else:
+            # SHORT: отслеживаем минимум цены
+            prev_min = _f(prot.get("min_price"), 0.0)
+            if prev_min <= 0:
+                prev_min = cp
+            min_price = min(prev_min, cp)
+            prot["min_price"] = min_price
+            watermark_price = min_price
 
         # --- entry price: кешируем из prot / ledger / open_trade ---
         entry_price = _f(prot.get("entry_price"), 0.0)
@@ -563,13 +635,28 @@ class AsyncStrategyRunner:
 
         # 1) breakeven стадия
         if entry_price > 0:
-            profit = cp - entry_price
+            if qty > 0:
+                # LONG: профит = цена выросла
+                profit = cp - entry_price
+            else:
+                # SHORT: профит = цена упала
+                profit = entry_price - cp
+            
             profit_atr = (profit / atr) if atr > 0 else 0.0
+            
             if profit_atr >= breakeven_atr:
-                be_sl = entry_price + (atr * breakeven_buffer_atr)
-                be_sl = min(be_sl, cp - min_gap)
-                if be_sl > sl_price:
-                    new_sl_candidate = be_sl
+                if qty > 0:
+                    # LONG: SL чуть выше entry
+                    be_sl = entry_price + (atr * breakeven_buffer_atr)
+                    be_sl = min(be_sl, cp - min_gap)
+                    if be_sl > sl_price:
+                        new_sl_candidate = be_sl
+                else:
+                    # SHORT: SL чуть ниже entry
+                    be_sl = entry_price - (atr * breakeven_buffer_atr)
+                    be_sl = max(be_sl, cp + min_gap)
+                    if be_sl < sl_price:
+                        new_sl_candidate = be_sl
 
         # 2) агрессивный трейл (SQUEEZE LOGIC)
         current_dist = abs(cp - sl_price)
@@ -590,11 +677,11 @@ class AsyncStrategyRunner:
             
             # Если TP есть, считаем Squeeze (сжатие пружины), но не зажимаем кита
             if tp_price_val > 0 and not is_whale_active:
-                if qty > 0: # LONG
-                    dist_remain = tp_price_val - max_price
+                if qty > 0:  # LONG
+                    dist_remain = tp_price_val - watermark_price
                     total_run = tp_price_val - entry_price
-                else: # SHORT
-                    dist_remain = max_price - tp_price_val
+                else:  # SHORT
+                    dist_remain = watermark_price - tp_price_val  # watermark_price = min_price
                     total_run = entry_price - tp_price_val
                 
                 if total_run <= 0: squeeze_factor = 1.0
@@ -610,17 +697,21 @@ class AsyncStrategyRunner:
                 # Если TP нет (Moon Mode?), используем линейный отступ
                 dynamic_offset = base_offset
 
-            if qty > 0: # LONG
-                trail_sl = max_price - dynamic_offset
-                trail_sl = min(trail_sl, cp - min_gap) # Защита от пересечения цены
-                if new_sl_candidate is None: new_sl_candidate = trail_sl
-                else: new_sl_candidate = max(new_sl_candidate, trail_sl)
+            if qty > 0:  # LONG
+                trail_sl = watermark_price - dynamic_offset
+                trail_sl = min(trail_sl, cp - min_gap)  # Защита от пересечения цены
+                if new_sl_candidate is None:
+                    new_sl_candidate = trail_sl
+                else:
+                    new_sl_candidate = max(new_sl_candidate, trail_sl)
             
-            else: # SHORT
-                trail_sl = max_price + dynamic_offset # Для шорта max_price это Low
-                trail_sl = max(trail_sl, cp + min_gap)
-                if new_sl_candidate is None: new_sl_candidate = trail_sl
-                else: new_sl_candidate = min(new_sl_candidate, trail_sl)
+            else:  # SHORT
+                trail_sl = watermark_price + dynamic_offset  # watermark_price = min_price для SHORT
+                trail_sl = max(trail_sl, cp + min_gap)  # SL должен быть ВЫШЕ текущей цены
+                if new_sl_candidate is None:
+                    new_sl_candidate = trail_sl
+                else:
+                    new_sl_candidate = min(new_sl_candidate, trail_sl)
 
             # Защита: стоп не должен пересекать цену (gap)
             if qty > 0:
@@ -642,11 +733,19 @@ class AsyncStrategyRunner:
 
         # --- финальные проверки: шаг и направление ---
         new_sl = float(new_sl_candidate)
-        new_sl = min(new_sl, cp - min_gap)  # не в упор к цене
-
-        min_step = atr * min_step_atr
-        if new_sl <= (sl_price + min_step):
-            return False
+        
+        if qty > 0:
+            # LONG: SL должен быть ниже цены, двигаем только вверх
+            new_sl = min(new_sl, cp - min_gap)  # не в упор к цене
+            min_step = atr * min_step_atr
+            if new_sl <= (sl_price + min_step):
+                return False
+        else:
+            # SHORT: SL должен быть выше цены, двигаем только вниз
+            new_sl = max(new_sl, cp + min_gap)  # не в упор к цене
+            min_step = atr * min_step_atr
+            if new_sl >= (sl_price - min_step):
+                return False
 
         # =========================
         # MODE: SYNTHETIC
@@ -657,9 +756,13 @@ class AsyncStrategyRunner:
             prot["trail_count"] = int(_f(prot.get("trail_count"), 0.0)) + 1
 
             print(
-                f"🚀 MOON MODE {symbol} [synthetic]: SL {sl_price:.6f} -> {new_sl:.6f} "
-                f"(cp={cp:.6f}, atr={atr:.6f}, max={max_price:.6f})"
+                f"🚀 MOON MODE {symbol} [synthetic {'SHORT' if qty < 0 else 'LONG'}]: SL {sl_price:.6f} -> {new_sl:.6f} "
+                f"(cp={cp:.6f}, atr={atr:.6f}, wm={watermark_price:.6f})"
             )
+            
+            # CRITICAL: Немедленный persist после изменения SL
+            self._persist_protections()
+            
             return True
 
         # =========================
@@ -671,8 +774,10 @@ class AsyncStrategyRunner:
             prot["trail_last_ts"] = now_ts
             prot["trail_count"] = int(_f(prot.get("trail_count"), 0.0)) + 1
             print(
-                f"🚀 MOON MODE {symbol} [native-sim]: SL {sl_price:.6f} -> {new_sl:.6f} (no-broker, mode={self._mode_value()})"
+                f"🚀 MOON MODE {symbol} [native-sim {'SHORT' if qty < 0 else 'LONG'}]: SL {sl_price:.6f} -> {new_sl:.6f} (no-broker, mode={self._mode_value()})"
             )
+            # CRITICAL: Немедленный persist после изменения SL
+            self._persist_protections()
             return True
 
         # LIVE native: cancel+replace SL только под lock (чтобы не было гонок с kill-switch/exit)
@@ -787,9 +892,13 @@ class AsyncStrategyRunner:
                 }
 
                 print(
-                    f"🚀 MOON MODE {symbol} [native]: SL {sl_price:.6f} -> {new_sl:.6f} "
-                    f"(cp={cp:.6f}, atr={atr:.6f}, max={max_price:.6f}, oid={new_order_id})"
+                    f"🚀 MOON MODE {symbol} [native {'SHORT' if qty < 0 else 'LONG'}]: SL {sl_price:.6f} -> {new_sl:.6f} "
+                    f"(cp={cp:.6f}, atr={atr:.6f}, wm={watermark_price:.6f}, oid={new_order_id})"
                 )
+                
+                # CRITICAL: Немедленный persist после изменения SL на бирже
+                self._persist_protections()
+                
                 return True
 
             except Exception as e:

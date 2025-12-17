@@ -345,7 +345,7 @@ class Config:
         'confluence_score',
 
         # КИТЫ
-        'whale_footprint', 'iceberg_pressure'
+        'whale_footprint', 'iceberg_pressure',
 
         # локальная структура и уровни
         'sup_dist_atr', 'res_dist_atr',

@@ -2437,6 +2437,18 @@ class FundManagerWindow(QMainWindow):
 
         loop = getattr(self, "_async_loop", None)
         router = getattr(self, "execution_router", None)
+
+        # Ensure router is initialized before kill switch
+        if not getattr(self, "_router_initialized", False):
+            try:
+                fut_init = asyncio.run_coroutine_threadsafe(router.initialize(), loop)
+                fut_init.result(timeout=12.0)
+                self._router_initialized = True
+            except Exception as e:
+                if hasattr(self, "live_log"):
+                    self.live_log.append(f"[KILL] ERROR: Router init failed: {e}")
+                return
+
         if loop is None or router is None:
             if hasattr(self, "live_log"):
                 self.live_log.append("[KILL] ERROR: async loop or router not ready.")
@@ -3012,11 +3024,22 @@ class FundManagerWindow(QMainWindow):
 
         print(f"[TRADING] Starting session with universe={Config.UNIVERSE_MODE.value}, assets={assets}")
 
-        # Создаем раннер, если его ещё нет
-        if self.live_trader is None:
-            self.live_trader = AsyncStrategyRunner()
+        # ВСЕГДА создаём новый runner с ОБЩИМ router'ом
+        # Сначала инициализируем GUI router если нужно
+        if not getattr(self, "_router_initialized", False):
+            try:
+                fut_init = asyncio.run_coroutine_threadsafe(
+                    self.execution_router.initialize(), 
+                    self._async_loop
+                )
+                fut_init.result(timeout=12.0)
+                self._router_initialized = True
+            except Exception as e:
+                print(f"[TRADING] Router init failed: {e}")
+                return
 
-        # Обновляем фильтр по активам
+        # Создаём новый runner с ОБЩИМ router'ом
+        self.live_trader = AsyncStrategyRunner(router=self.execution_router)
         self.live_trader.set_assets(assets)
 
         if not hasattr(self, "_async_loop") or self._async_loop is None:
@@ -3069,7 +3092,14 @@ class FundManagerWindow(QMainWindow):
 
         if self.live_trader_task is not None:
             self.live_trader_task.cancel()
+            try:
+                self.live_trader_task.result(timeout=5.0)
+            except (asyncio.CancelledError, Exception):
+                pass
             self.live_trader_task = None
+
+        # Очищаем runner для следующего старта
+        self.live_trader = None
 
         self.trading_session_active = False
 

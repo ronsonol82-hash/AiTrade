@@ -232,6 +232,20 @@ class TradeLedger:
                 )
                 self._conn.commit()
 
+    def get_trade_entry_price(self, trade_id: str) -> Optional[float]:
+        """
+        Возвращает entry_price для указанного trade_id.
+        Используется в trailing логике для расчёта breakeven.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT entry_price FROM trades WHERE trade_id = ?",
+                (trade_id,),
+            ).fetchone()
+            if row and row["entry_price"] is not None:
+                return float(row["entry_price"])
+            return None
+
     def get_order(self, client_id: str) -> Optional[Dict[str, Any]]:
         with self._lock:
             row = self._conn.execute("SELECT * FROM orders WHERE client_id=?", (client_id,)).fetchone()
