@@ -10,10 +10,10 @@ class RedisSignalBus:
         self.key = "trade_signals:latest"
 
     def publish_signals(self, signals_dict):
-        """Pickle dump и запись в Redis с TTL 60 сек"""
+        """Pickle dump и запись в Redis с TTL 300 сек"""
         try:
             packed = pickle.dumps(signals_dict)
-            self.r.set(self.key, packed, ex=60)
+            self.r.set(self.key, packed, ex=300)
             print(f"[Redis] Published signals for {len(signals_dict)} keys")
         except Exception as e:
             print(f"[Redis] Publish ERROR: {e}")
