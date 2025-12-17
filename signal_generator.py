@@ -15,6 +15,7 @@ from risk_utils import calc_position_size
 import argparse
 from joblib import Parallel, delayed
 import multiprocessing
+from utils.redis_connector import RedisSignalBus
 
 # --- HELPER FOR PARALLEL TRAINING ---
 def train_wrapper(sym, model_obj, data_slice, features):
@@ -43,17 +44,18 @@ class UniversalSignalFactory:
         train_window: int | None = None,
         trade_window: int | None = None,
         ):
+        self.redis_bus = RedisSignalBus()
         self.preset = regime_preset
         self.cross_asset_wf = cross_asset_wf
         self.train_window = train_window
         self.trade_window = trade_window
 
         self.data: dict[str, pd.DataFrame] = {}
-
+        
         # Универсальный набор фич без абсолютных цен
         # (align с Config.UNIVERSAL_FEATURE_COLS)
         self.feature_cols = Config.UNIVERSAL_FEATURE_COLS
-
+        
         # 🧠 Учителя завязываем на UNIVERSE_MODE + cross_asset_wf
         mode = Config.UNIVERSE_MODE
 
@@ -278,10 +280,17 @@ class UniversalSignalFactory:
         # 5) Мерджим с существующими сигналами и сохраняем
         merged_data = self._merge_with_existing_signals(production_data)
 
+        # Пушим в Redis
+        self.redis_bus.publish_signals(merged_data)
+        print(f"📡 [SIGNAL] Signals pushed to Redis ({len(merged_data)} assets)")
+
+        # (Опционально) Оставляем запись в файл как бэкап, если хочешь, 
+        # но раннер будет читать из Redis.
         with open(self.OUTPUT_FILE, "wb") as f:
             pickle.dump(merged_data, f)
 
         mode = Config.UNIVERSE_MODE
+        print(f"💾 [UNIVERSAL] Сигналы сохранены (Redis + File)")
         print(f"💾 [UNIVERSAL] Сигналы для {mode.value} сохранены/обновлены в {self.OUTPUT_FILE}")
         print("➡️  Дальше можно запускать debug_replayer.py / backtester.py")
 
@@ -325,6 +334,7 @@ class SignalFactory:
         self.data = {}
         self.models = {}
         self.feature_cols = Config.FEATURE_COLS
+        self.redis_bus = RedisSignalBus()
         self.preset = regime_preset
         self.force_reset = force_reset
         # NEW: окна из GUI
@@ -580,6 +590,10 @@ class SignalFactory:
         for sym, df in production_data.items():
             final_output[sym] = df.loc[start_date:]
             
+        # Сначала в Redis
+        self.redis_bus.publish_signals(final_output)
+        print(f"📡 [SIGNAL] WF Signals pushed to Redis")
+
         with open(self.OUTPUT_FILE, "wb") as f:
             pickle.dump(final_output, f)
             

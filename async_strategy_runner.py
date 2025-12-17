@@ -9,11 +9,11 @@ import time
 import os
 import gc
 import re
-from datetime import datetime
-from typing import Dict, Any
-
 import pandas as pd
 
+from datetime import datetime
+from typing import Dict, Any
+from utils.redis_connector import RedisSignalBus
 from config import Config
 from execution_router import ExecutionRouter
 from risk_utils import calc_position_size
@@ -33,6 +33,7 @@ class AsyncStrategyRunner:
     def __init__(self, signals_file: str = "data_cache/production_signals_v1.pkl"):
         self.signals_file = signals_file
         self.signals: Dict[str, pd.DataFrame] = {}
+        self.redis_bus = RedisSignalBus()
         self.router = ExecutionRouter()
 
         # LIVE safety: сериализуем торговые действия + блокируем новые ордера при kill-switch
@@ -69,14 +70,57 @@ class AsyncStrategyRunner:
         self._heartbeat_every_s = float(getattr(Config, "HEARTBEAT_EVERY_S", 5.0) or 5.0)
         self._last_heartbeat_ts = 0.0
 
+    # --- Сверка позиций ---
+    async def reconcile_state(self):
+        """
+        Критически важная функция. Синхронизирует память бота с реальностью (брокером).
+        Вызывается ПЕРЕД началом торгов.
+        """
+        print("🔄 [RECONCILE] Starting state reconciliation...")
+        try:
+            # 1. Запрашиваем у брокера (Bitget или Simulator), что у нас открыто
+            # Важно: router.broker должен быть уже инициализирован
+            real_positions = await self.router.broker.list_open_positions()
+            
+            # 2. Очищаем память роутера о позициях
+            self.router._active_positions = {} 
+            
+            count = 0
+            for pos in real_positions:
+                # Фильтруем мусорные остатки (пыль)
+                if abs(pos.quantity) > 0:
+                    print(f"   Found existing position: {pos.symbol} Size: {pos.quantity:.4f} @ {pos.avg_price}")
+                    
+                    # 3. Восстанавливаем позицию в структуру роутера
+                    # Структура должна совпадать с тем, что ждет execute_trade
+                    self.router._active_positions[pos.symbol] = {
+                        'size': pos.quantity,
+                        'entry_price': pos.avg_price, 
+                        'side': 'long' if pos.quantity > 0 else 'short',
+                        'last_update': datetime.utcnow()
+                    }
+                    count += 1
+                    
+            print(f"✅ [RECONCILE] Complete. Restored {count} active positions.")
+            
+        except Exception as e:
+            print(f"❌ [RECONCILE FATAL ERROR]: {e}")
+            # Если сверка упала — лучше не торговать, иначе наломаем дров
+            raise e
+
     async def initialize(self) -> None:
         await self.router.initialize()
         self.load_signals()
+        
+        # --- Reconcile Router Memory ---
+        # Сначала восстанавливаем память роутера, чтобы он знал о позициях
+        await self.reconcile_state() 
+        
         self._protections = atomic_read_json(self._protections_file, {}) or {}
         if self._protections:
             print(f"🛡️  Restored protections: {len(self._protections)}")
 
-        # (4) reconcile при старте
+        # (4) reconcile ledger (это старый метод, он сверяет базу данных сделок)
         await self._reconcile_on_startup()
 
     def set_assets(self, assets: list[str]):
@@ -222,18 +266,32 @@ class AsyncStrategyRunner:
             self._persist_protections()
 
     def load_signals(self) -> None:
-        self.signals = atomic_read_pickle(self.signals_file, {}) or {}
+        # Пробуем читать из Redis
+        redis_signals = self.redis_bus.get_signals()
+        
+        if redis_signals:
+            self.signals = redis_signals
+            print(f"📊 [REDIS] Signals loaded for {len(self.signals)} assets")
+        else:
+            # Fallback на файл, если Redis пуст
+            print("⚠️ [REDIS] Empty, falling back to file...")
+            self.signals = atomic_read_pickle(self.signals_file, {}) or {}
+            
         try:
             self._signals_mtime = os.path.getmtime(self.signals_file)
         except Exception:
             self._signals_mtime = None
-        print(f"📊 Загружено сигналов для {len(self.signals)} активов")
 
     def _maybe_reload_signals(self) -> None:
         """
-        Если production_signals_v1.pkl обновился — перечитываем.
-        Это делает раннер совместимым с регулярным запуском signal_generator по cron.
+        Читаем свежие сигналы из Redis на каждом цикле.
+        Это быстро, так как Redis in-memory.
         """
+        # Просто вызываем load_signals, который теперь ходит в Redis
+        # Можно добавить проверку флага или TTL, но чтение из Redis дешевое.
+        new_signals = self.redis_bus.get_signals()
+        if new_signals:
+            self.signals = new_signals
         try:
             mtime = os.path.getmtime(self.signals_file)
         except Exception:
