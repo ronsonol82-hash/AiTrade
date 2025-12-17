@@ -4,9 +4,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Dict, List
-
+import asyncio
+import random
+import json             # <--- Добавлено
+import os               # <--- Добавлено
 import pandas as pd
-
+from config import Config
 from .base import BrokerAPI, OrderRequest, OrderResult, Position, AccountState
 
 
@@ -50,6 +53,56 @@ class SimulatedBroker(BrokerAPI):
 
         # Простая генерация ID ордеров
         self._order_seq = 0
+        
+        # --- [NEW] Persistence ---
+        # Файл состояния, чтобы выжить после перезагрузки
+        self.state_file = f"state/{self.name}_state.json"
+        if not os.path.exists("state"):
+            os.makedirs("state", exist_ok=True)
+        self._load_state()  # Пробуем восстановиться при старте
+
+    # ------------------------------------------------------------------
+    # PERSISTENCE (Сохранение/Загрузка)
+    # ------------------------------------------------------------------
+    def _save_state(self):
+        """Сохраняем Equity, Позиции и (ВАЖНО!) счетчик ордеров."""
+        data = {
+            "equity": self._starting_equity,
+            "realized_pnl": self._realized_pnl,
+            "order_seq": self._order_seq,  # <--- Чтобы не было дублей ID
+            "positions": {
+                sym: {"qty": p.quantity, "avg": p.avg_price}
+                for sym, p in self._positions.items() if p.quantity != 0
+            }
+        }
+        try:
+            with open(self.state_file, 'w') as f:
+                json.dump(data, f, indent=2)
+        except Exception as e:
+            print(f"[SIM] ⚠️ Failed to save state: {e}")
+
+    def _load_state(self):
+        """Восстанавливаем состояние."""
+        if not os.path.exists(self.state_file):
+            return
+        try:
+            with open(self.state_file, 'r') as f:
+                data = json.load(f)
+            
+            self._starting_equity = data.get("equity", self._starting_equity)
+            self._realized_pnl = data.get("realized_pnl", 0.0)
+            self._order_seq = int(data.get("order_seq", 0))
+            
+            loaded_pos = data.get("positions", {})
+            self._positions = {}
+            for sym, p_data in loaded_pos.items():
+                self._positions[sym] = _SimPositionState(
+                    quantity=p_data["qty"],
+                    avg_price=p_data["avg"]
+                )
+            print(f"♻️ [SIM] State restored! Eq: {self._starting_equity + self._realized_pnl:.2f}, Orders: {self._order_seq}")
+        except Exception as e:
+            print(f"[SIM] ⚠️ Failed to load state: {e}")
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -161,11 +214,20 @@ class SimulatedBroker(BrokerAPI):
 
     async def place_order(self, order: OrderRequest) -> OrderResult:
         """
-        Упрощённая логика:
-          - ордер всегда исполняется "мгновенно" по текущей цене
-            (или по переданному order.price, если он указан)
-          - PnL считаем только реализованный; маржу/комиссии и риск не трогаем (пока)
+        Реалистичная симуляция:
+          1. Задержка сети (latency)
+          2. Проскальзывание (slippage) для Market-ордеров
+          3. Margin Call проверка
+          4. Сохранение состояния на диск
         """
+        # 0. Margin Call Check
+        acc = await self.get_account_state()
+        if acc.equity <= 0:
+             raise RuntimeError(f"GAME OVER: Equity is {acc.equity}. Margin Call.")
+
+        # 1. Latency simulation (50ms - 300ms)
+        await asyncio.sleep(random.uniform(0.05, 0.3))
+
         symbol = order.symbol
         side = order.side
         qty = float(order.quantity)
@@ -173,68 +235,66 @@ class SimulatedBroker(BrokerAPI):
         if qty <= 0:
             raise ValueError("SimulatedBroker: quantity must be > 0")
 
-        # "Исполняем" ордер
-        trade_price = (
-            float(order.price)
-            if order.price is not None
-            else float(await self.get_current_price(symbol))
-        )
+        # 2. Price & Slippage simulation
+        current_market_price = float(await self.get_current_price(symbol))
+        
+        if order.price is not None:
+            # Limit order - исполняем по заявленной (упрощение)
+            trade_price = float(order.price)
+        else:
+            # Market order - добавляем Slippage
+            # Берем настройку из конфига или дефолт 0.1%
+            slippage_pct = getattr(Config, 'SLIPPAGE', 0.001) 
+            
+            # Эмуляция: покупка всегда чуть дороже, продажа чуть дешевле
+            if side == "buy":
+                trade_price = current_market_price * (1 + slippage_pct)
+            else:
+                trade_price = current_market_price * (1 - slippage_pct)
 
-        # Обновляем состояние позиции
+        # 3. Update Position Logic
         state = self._positions.get(symbol, _SimPositionState())
-
         signed_qty = qty if side == "buy" else -qty
 
         if state.quantity == 0:
-            # Открытие новой позиции
             state.quantity = signed_qty
             state.avg_price = trade_price
-
         else:
-            # Есть существующая позиция
             old_qty = state.quantity
             old_avg = state.avg_price
 
-            # Тот же direction (усиление позиции)
             if (old_qty > 0 and signed_qty > 0) or (old_qty < 0 and signed_qty < 0):
+                # Усреднение
                 new_qty = old_qty + signed_qty
                 if new_qty == 0:
-                    state.quantity = 0.0
-                    state.avg_price = 0.0
+                    state.quantity = 0.0; state.avg_price = 0.0
                 else:
                     state.avg_price = (old_avg * old_qty + trade_price * signed_qty) / new_qty
                     state.quantity = new_qty
-
             else:
-                # Частичное/полное закрытие или разворот
+                # Закрытие / Разворот
                 closing_qty = min(abs(old_qty), abs(signed_qty))
-
-                if old_qty > 0:
-                    # закрываем long
-                    realized = (trade_price - old_avg) * closing_qty
-                else:
-                    # закрываем short
-                    realized = (old_avg - trade_price) * closing_qty
-
+                realized = (trade_price - old_avg) * closing_qty if old_qty > 0 else (old_avg - trade_price) * closing_qty
+                
                 self._realized_pnl += realized
 
                 new_qty = old_qty + signed_qty
                 if new_qty == 0:
-                    state.quantity = 0.0
-                    state.avg_price = 0.0
+                    state.quantity = 0.0; state.avg_price = 0.0
                 else:
-                    # Для простоты считаем, что "обратный хвост" открыт по текущей цене
                     state.quantity = new_qty
-                    state.avg_price = trade_price
+                    state.avg_price = trade_price # Хвост по новой цене
 
         self._positions[symbol] = state
-
+        
+        # 4. Generate ID & SAVE STATE
         order_id = self._next_order_id()
+        self._save_state()  # <--- ВАЖНО: Сохраняем сразу после сделки
 
         return OrderResult(
             order_id=order_id,
             symbol=symbol,
-            side=order.side,
+            side=side,
             quantity=qty,
             price=trade_price,
             status="filled",
