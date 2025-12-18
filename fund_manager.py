@@ -313,25 +313,41 @@ class UtilityWorker(QThread):
             import subprocess
             from config import Config, UniverseMode
 
-            python_exe = sys.executable 
             env = os.environ.copy()
             env["PYTHONIOENCODING"] = "utf-8"
+            
+            # --- ИЗМЕНЕНИЯ НАЧИНАЮТСЯ ЗДЕСЬ ---
+            if getattr(sys, 'frozen', False):
+                # Мы в EXE. Питона нет. Запускаем соседний EXE.
+                # Превращаем "optimizer.py" -> "optimizer.exe"
+                exe_name = self.script_name.replace('.py', '.exe')
+                # Путь к папке, где лежит наш fund_manager.exe
+                base_dir = os.path.dirname(sys.executable)
+                exe_path = os.path.join(base_dir, exe_name)
+                
+                cmd = [exe_path] + self.args
+                # Скрываем черное окно консоли запускаемого процесса
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+                startupinfo.wShowWindow = subprocess.SW_HIDE
+                creationflags = subprocess.CREATE_NO_WINDOW
+            else:
+                # Мы в редакторе (PyCharm). Работаем как раньше.
+                cmd = [sys.executable, "-u", self.script_name] + self.args
+                startupinfo = None
+                creationflags = 0
+            # --- ИЗМЕНЕНИЯ ЗАКОНЧИЛИСЬ ---
 
-            # 🔁 Прокидываем выбранный юниверс в дочерний процесс
+            # Прокидываем конфиги (без изменений)
             try:
                 mode_obj = getattr(Config, "UNIVERSE_MODE", None)
                 if isinstance(mode_obj, UniverseMode):
                     env["UNIVERSE_MODE"] = mode_obj.value
-                    print(f"[SYSTEM] Passing UNIVERSE_MODE={mode_obj.value} to child process")
-            except Exception:
-                pass
-
-            # 🔁 Прокидываем флаги использования лидеров
+            except Exception: pass
+            
             env["USE_LEADER_CRYPTO"] = "1" if getattr(Config, "USE_LEADER_CRYPTO", True) else "0"
             env["USE_LEADER_STOCKS"] = "1" if getattr(Config, "USE_LEADER_STOCKS", True) else "0"
 
-            cmd = [python_exe, "-u", self.script_name] + self.args
-            
             process = subprocess.Popen(
                 cmd,
                 stdout=subprocess.PIPE,
@@ -339,14 +355,21 @@ class UtilityWorker(QThread):
                 text=True,
                 encoding='utf-8', 
                 errors='replace',
-                env=env
+                env=env,
+                startupinfo=startupinfo,
+                creationflags=creationflags
             )
+            
             for line in process.stdout:
                 print(line.strip())
-            for line in process.stderr:
-                print(f"STDERR: {line.strip()}")
+            
+            stderr_out = process.stderr.read()
+            if stderr_out:
+                print(f"STDERR: {stderr_out}")
+                
             process.wait()
             self.finished.emit("Done")
+            
         except Exception as e:
             print(f"[ERROR] Launch failed: {e}")
             self.finished.emit("Error")
